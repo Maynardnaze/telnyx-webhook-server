@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data and secrets
+data/*
+!data/.gitkeep
+secrets/*
+!secrets/.gitkeep
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

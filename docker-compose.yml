@@ -1,0 +1,37 @@
+services:
+  telnyx-webhook-server:
+    container_name: telnyx-webhook-server
+    build:
+      context: .
+    restart: unless-stopped
+    networks:
+      - t3_proxy
+    environment:
+      TZ: ${TZ:-America/Detroit}
+      WEBHOOK_JOBS_PATH: /data/jobs.json
+      WEBHOOK_INSIGHTS_PATH: /data/insights.json
+      WEBHOOK_SECRET_FILE: /run/secrets/telnyx_webhook_secret
+      DIRECTORY_WEBHOOK_SECRET_FILE: /run/secrets/telnyx_webhook_secret
+      TELNYX_PUBLIC_KEY: ${TELNYX_PUBLIC_KEY:-}
+      GUEST_SERVICES_PHONE: ${TELNYX_DIRECTORY_GUEST_SERVICES_PHONE:-+124****0000}
+    secrets:
+      - telnyx_webhook_secret
+    volumes:
+      - ./data:/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=t3_proxy"
+      - "traefik.http.routers.telnyx-webhook-rtr.rule=Host(`webhook.miswitch.cloud`)"
+      - "traefik.http.routers.telnyx-webhook-rtr.entrypoints=websecure-external"
+      - "traefik.http.routers.telnyx-webhook-rtr.tls=true"
+      - "traefik.http.routers.telnyx-webhook-rtr.middlewares=chain-no-auth@file"
+      - "traefik.http.routers.telnyx-webhook-rtr.service=telnyx-webhook-svc"
+      - "traefik.http.services.telnyx-webhook-svc.loadbalancer.server.port=8787"
+
+networks:
+  t3_proxy:
+    external: true
+
+secrets:
+  telnyx_webhook_secret:
+    file: ./secrets/telnyx_webhook_secret
