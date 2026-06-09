@@ -13,7 +13,7 @@ services:
       WEBHOOK_SECRET_FILE: /run/secrets/telnyx_webhook_secret
       DIRECTORY_WEBHOOK_SECRET_FILE: /run/secrets/telnyx_webhook_secret
       TELNYX_PUBLIC_KEY: ${TELNYX_PUBLIC_KEY:-}
-      GUEST_SERVICES_PHONE: ${TELNYX_DIRECTORY_GUEST_SERVICES_PHONE:-+124****0000}
+      GUEST_SERVICES_PHONE: ${TELNYX_DIRECTORY_GUEST_SERVICES_PHONE:-+12400000000}
     secrets:
       - telnyx_webhook_secret
     volumes:
@@ -21,7 +21,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=t3_proxy"
-      - "traefik.http.routers.telnyx-webhook-rtr.rule=Host(`webhook.miswitch.cloud`)"
+      - "traefik.http.routers.telnyx-webhook-rtr.rule=Host(`webhook.${DOMAINNAME_1:-miswitch.cloud}`)"
       - "traefik.http.routers.telnyx-webhook-rtr.entrypoints=websecure-external"
       - "traefik.http.routers.telnyx-webhook-rtr.tls=true"
       - "traefik.http.routers.telnyx-webhook-rtr.middlewares=chain-no-auth@file"

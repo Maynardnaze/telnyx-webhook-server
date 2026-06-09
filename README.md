@@ -159,9 +159,23 @@ curl -s http://127.0.0.1:8787/telnyx/mall-directory/search \
   -d '{"query":"apple"}'
 ```
 
-## Production deploy
+## Production deploy: standalone repo beside `~/docker`
 
-Clone this repo as a standalone app next to the main Docker-Traefik stack:
+This repo is intended to run as its own Compose project at:
+
+```text
+~/telnyx-webhook-server
+```
+
+Keep the main Docker-Traefik repo separate at:
+
+```text
+~/docker
+```
+
+The standalone webhook container joins the existing external `t3_proxy` network, so the Traefik instance from `~/docker` can route to it by Docker labels.
+
+### 1. Clone/update this app repo
 
 ```bash
 cd ~
@@ -171,21 +185,85 @@ cp .env.example .env
 mkdir -p data secrets
 ```
 
-Create the shared-secret file used by directory tools and curl fallback tests:
+If the repo already exists:
 
 ```bash
-nano secrets/telnyx_webhook_secret
+cd ~/telnyx-webhook-server
+git pull
+mkdir -p data secrets
 ```
 
-Optional but recommended: add your Telnyx public key to `.env` as `TELNYX_PUBLIC_KEY=...` so Insight Groups can post to the clean URL without `?secret=`.
+### 2. Make sure the old `~/docker` include is disabled
 
-Deploy with the standalone compose file:
+If `~/docker/docker-compose-gpu-server.yml` still includes the old infra-managed service, comment it out so one Traefik router/container owns `webhook.miswitch.cloud`:
+
+```yaml
+# - compose/$HOSTNAME/telnyx-webhook-server.yml
+```
+
+If the old container is still running, remove it before starting this standalone app:
 
 ```bash
+docker stop telnyx-webhook-server 2>/dev/null || true
+docker rm telnyx-webhook-server 2>/dev/null || true
+```
+
+### 3. Configure runtime env
+
+Edit the standalone app env file:
+
+```bash
+nano ~/telnyx-webhook-server/.env
+```
+
+Minimum recommended values:
+
+```env
+TZ=America/Detroit
+DOMAINNAME_1=miswitch.cloud
+TELNYX_PUBLIC_KEY=PASTE_TELNYX_PUBLIC_KEY_HERE
+```
+
+`TELNYX_PUBLIC_KEY` is Telnyx's public Ed25519 verification key from Mission Control Portal. It is a public key, not an API secret, so storing it in `.env` is fine.
+
+### 4. Configure the shared-secret fallback
+
+Create the shared-secret file used by directory tools, the read-only `/jobs` and `/telnyx/insights` inspection endpoints, and curl fallback tests:
+
+```bash
+nano ~/telnyx-webhook-server/secrets/telnyx_webhook_secret
+chmod 600 ~/telnyx-webhook-server/secrets/telnyx_webhook_secret
+```
+
+Put only the secret value in the file. Do not include `WEBHOOK_SECRET=`.
+
+### 5. Deploy standalone
+
+```bash
+cd ~/telnyx-webhook-server
 docker compose up -d --build
 ```
 
-This compose project attaches to the existing external `t3_proxy` network, so the main Traefik instance in `~/docker` can route to it by label.
+### 6. Verify it is running from the standalone repo
+
+```bash
+docker inspect telnyx-webhook-server \
+  --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}'
+```
+
+Expected:
+
+```text
+/home/andrew/telnyx-webhook-server
+```
+
+Check env wiring:
+
+```bash
+docker exec telnyx-webhook-server printenv | grep -E 'TELNYX|WEBHOOK'
+```
+
+`TELNYX_PUBLIC_KEY` should not be blank.
 
 Then test from anywhere:
 
@@ -194,3 +272,38 @@ curl -skS https://webhook.miswitch.cloud/health
 ```
 
 Expected: HTTP 200 with service status.
+
+### 7. Confirm Telnyx Insight Group delivery
+
+The clean Insight Group webhook URL should be:
+
+```text
+https://webhook.miswitch.cloud/telnyx/insights
+```
+
+Watch logs during/after a call:
+
+```bash
+docker logs -f telnyx-webhook-server
+```
+
+A successful Telnyx delivery should show:
+
+```text
+POST /telnyx/insights HTTP/1.1" 200 OK
+```
+
+Rejected signature/auth attempts show `401 Unauthorized`.
+
+Inspect accepted records with the shared secret:
+
+```bash
+curl -skS "https://webhook.miswitch.cloud/telnyx/insights?secret=$(cat ~/telnyx-webhook-server/secrets/telnyx_webhook_secret)"
+```
+
+New real Telnyx records should include:
+
+```json
+"telnyx_signature_present": true,
+"telnyx_signature_verified": true
+```
