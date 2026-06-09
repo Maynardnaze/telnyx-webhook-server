@@ -5,6 +5,7 @@ import binascii
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -25,8 +26,10 @@ except ImportError:  # pragma: no cover - only happens if optional dependency is
 
 APP_DIR = Path(__file__).parent
 DATA_PATH = Path(os.environ.get("DIRECTORY_DATA", APP_DIR / "tenants.json"))
-JOBS_PATH = Path(os.environ.get("WEBHOOK_JOBS_PATH", "/data/jobs.json"))
-INSIGHTS_PATH = Path(os.environ.get("WEBHOOK_INSIGHTS_PATH", "/data/insights.json"))
+DB_PATH = Path(os.environ.get("WEBHOOK_DB_PATH", "/data/webhook.db"))
+# Legacy JSON paths used only for one-time migration into SQLite.
+_LEGACY_JOBS_PATH = Path(os.environ.get("WEBHOOK_JOBS_PATH", "/data/jobs.json"))
+_LEGACY_INSIGHTS_PATH = Path(os.environ.get("WEBHOOK_INSIGHTS_PATH", "/data/insights.json"))
 
 
 def env_or_file(name: str, default: str | None = None) -> str | None:
@@ -50,7 +53,7 @@ app = FastAPI(
     description="Public webhook tools for Telnyx AI Assistants behind webhook.miswitch.cloud.",
 )
 
-_jobs_lock = threading.Lock()
+_db_lock = threading.Lock()
 
 
 def utc_now() -> str:
@@ -178,49 +181,161 @@ def directory_lookup(query: str) -> dict[str, Any]:
     }
 
 
+def _db_connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS insights (
+                    id TEXT PRIMARY KEY,
+                    received_at TEXT NOT NULL,
+                    data TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_insights_received_at ON insights(received_at);
+                """
+            )
+            conn.commit()
+            _migrate_legacy_json(conn)
+        finally:
+            conn.close()
+
+
+def _migrate_legacy_json(conn: sqlite3.Connection) -> None:
+    job_count = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    if job_count == 0 and _LEGACY_JOBS_PATH.exists():
+        try:
+            jobs = json.loads(_LEGACY_JOBS_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            jobs = {}
+        if isinstance(jobs, dict):
+            for job_id, data in jobs.items():
+                if isinstance(data, dict):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO jobs (job_id, data, updated_at) VALUES (?, ?, ?)",
+                        (job_id, json.dumps(data, separators=(",", ":")), data.get("completed_at") or data.get("accepted_at") or utc_now()),
+                    )
+            conn.commit()
+
+    insight_count = conn.execute("SELECT COUNT(*) FROM insights").fetchone()[0]
+    if insight_count == 0 and _LEGACY_INSIGHTS_PATH.exists():
+        try:
+            insights = json.loads(_LEGACY_INSIGHTS_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            insights = []
+        if isinstance(insights, list):
+            for record in insights[-500:]:
+                if isinstance(record, dict) and record.get("id"):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO insights (id, received_at, data) VALUES (?, ?, ?)",
+                        (
+                            record["id"],
+                            record.get("received_at") or utc_now(),
+                            json.dumps(record, separators=(",", ":")),
+                        ),
+                    )
+            conn.commit()
+
+
 def read_jobs() -> dict[str, Any]:
-    if not JOBS_PATH.exists():
-        return {}
-    try:
-        return json.loads(JOBS_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
-def write_jobs(jobs: dict[str, Any]) -> None:
-    JOBS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = JOBS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(jobs, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(JOBS_PATH)
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            rows = conn.execute("SELECT job_id, data FROM jobs").fetchall()
+            jobs: dict[str, Any] = {}
+            for row in rows:
+                try:
+                    jobs[row["job_id"]] = json.loads(row["data"])
+                except json.JSONDecodeError:
+                    continue
+            return jobs
+        finally:
+            conn.close()
 
 
 def save_job(job_id: str, patch: dict[str, Any]) -> None:
-    with _jobs_lock:
-        jobs = read_jobs()
-        current = jobs.get(job_id, {})
-        current.update(patch)
-        jobs[job_id] = current
-        write_jobs(jobs)
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            row = conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            current: dict[str, Any] = {}
+            if row:
+                try:
+                    current = json.loads(row["data"])
+                except json.JSONDecodeError:
+                    current = {}
+            current.update(patch)
+            conn.execute(
+                """
+                INSERT INTO jobs (job_id, data, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at
+                """,
+                (job_id, json.dumps(current, separators=(",", ":")), utc_now()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def read_insights() -> list[dict[str, Any]]:
-    if not INSIGHTS_PATH.exists():
-        return []
-    try:
-        data = json.loads(INSIGHTS_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
-    return data if isinstance(data, list) else []
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            rows = conn.execute("SELECT data FROM insights ORDER BY received_at ASC").fetchall()
+            insights: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    record = json.loads(row["data"])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    insights.append(record)
+            return insights
+        finally:
+            conn.close()
 
 
 def append_insight(record: dict[str, Any]) -> None:
-    with _jobs_lock:
-        insights = read_insights()
-        insights.append(record)
-        INSIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = INSIGHTS_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(insights[-500:], indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(INSIGHTS_PATH)
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO insights (id, received_at, data) VALUES (?, ?, ?)",
+                (
+                    record["id"],
+                    record.get("received_at") or utc_now(),
+                    json.dumps(record, separators=(",", ":")),
+                ),
+            )
+            excess = conn.execute("SELECT COUNT(*) - 500 FROM insights").fetchone()[0]
+            if excess > 0:
+                conn.execute(
+                    """
+                    DELETE FROM insights
+                    WHERE id IN (
+                        SELECT id FROM insights ORDER BY received_at ASC LIMIT ?
+                    )
+                    """,
+                    (excess,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+init_db()
 
 
 def process_async_directory_job(job_id: str, query: str, call_control_id: str | None, payload: dict[str, Any]) -> None:

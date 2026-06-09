@@ -8,8 +8,7 @@ services:
       - t3_proxy
     environment:
       TZ: ${TZ:-America/Detroit}
-      WEBHOOK_JOBS_PATH: /data/jobs.json
-      WEBHOOK_INSIGHTS_PATH: /data/insights.json
+      WEBHOOK_DB_PATH: /data/webhook.db
       WEBHOOK_SECRET_FILE: /run/secrets/telnyx_webhook_secret
       DIRECTORY_WEBHOOK_SECRET_FILE: /run/secrets/telnyx_webhook_secret
       TELNYX_PUBLIC_KEY: ${TELNYX_PUBLIC_KEY:-}
