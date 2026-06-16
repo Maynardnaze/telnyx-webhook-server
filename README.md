@@ -17,11 +17,15 @@ https://webhook.miswitch.cloud
 
 The server returns fast `200` acknowledgements so Telnyx does not retry deliveries.
 
+**Insight payload reference:** [docs/telnyx-insights.md](docs/telnyx-insights.md) — webhook shape, stored record format, channel metadata, and real-world examples.
+
 ## Repository layout
 
 ```text
 telnyx-webhook-server/
 ├── app.py                 # FastAPI application
+├── docs/
+│   └── telnyx-insights.md # Insight Group webhook format and examples
 ├── docker-compose.yml     # Production Compose stack
 ├── Dockerfile
 ├── data/                  # Runtime data (gitignored except .gitkeep)
@@ -219,6 +223,8 @@ Real Telnyx deliveries should show:
 "telnyx_signature_present": true,
 "telnyx_signature_verified": true
 ```
+
+For field-by-field documentation, result format variations, and full payload examples, see [docs/telnyx-insights.md](docs/telnyx-insights.md).
 
 ## Telnyx setup
 
