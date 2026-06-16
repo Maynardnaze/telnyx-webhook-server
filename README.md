@@ -17,7 +17,7 @@ https://webhook.miswitch.cloud
 
 The server returns fast `200` acknowledgements so Telnyx does not retry deliveries.
 
-**Insight payload reference:** [docs/telnyx-insights.md](docs/telnyx-insights.md) — webhook shape, stored record format, channel metadata, and real-world examples.
+**Insight payload reference:** [docs/telnyx-insights.md](docs/telnyx-insights.md) — webhook shape, stored record format, and the **MySwitch** Insight Group (`e58ece8c-…`) with `insight_id` mappings and examples.
 
 ## Repository layout
 
