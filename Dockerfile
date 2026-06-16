@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN pip install --no-cache-dir fastapi 'uvicorn[standard]' pynacl
 
-COPY app.py tenants.json /app/
+COPY app.py /app/
 
 RUN mkdir -p /data
 
