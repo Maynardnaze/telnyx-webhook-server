@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -12,9 +14,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 try:
     from nacl.exceptions import BadSignatureError
@@ -53,6 +58,8 @@ app = FastAPI(
     version="0.2.0",
     description="Public webhook receiver for Telnyx behind webhook.miswitch.cloud.",
 )
+templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
+app.mount("/admin/static", StaticFiles(directory=str(APP_DIR / "static"), check_dir=False), name="admin_static")
 
 _db_lock = threading.Lock()
 
@@ -67,6 +74,54 @@ def check_secret(x_webhook_secret: str | None, query_secret: str | None = None) 
     supplied = x_webhook_secret or query_secret
     if supplied != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Missing or invalid webhook secret")
+
+
+def _secret_matches(supplied: str | None) -> bool:
+    return bool(supplied) and hmac.compare_digest(str(supplied), str(WEBHOOK_SECRET))
+
+
+def _admin_signature(payload: str) -> str:
+    return hmac.new(WEBHOOK_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def make_admin_session() -> str:
+    issued = str(int(time.time()))
+    payload = f"admin:{issued}"
+    return f"{payload}.{_admin_signature(payload)}"
+
+
+def verify_admin_session(cookie_value: str | None) -> bool:
+    if not cookie_value or "." not in cookie_value:
+        return False
+    payload, signature = cookie_value.rsplit(".", 1)
+    if not hmac.compare_digest(signature, _admin_signature(payload)):
+        return False
+    try:
+        role, issued = payload.split(":", 1)
+        issued_at = int(issued)
+    except ValueError:
+        return False
+    return role == "admin" and 0 <= time.time() - issued_at <= 60 * 60 * 12
+
+
+def is_admin_request(request: Request) -> bool:
+    return verify_admin_session(request.cookies.get("admin_session"))
+
+
+def require_admin_response(request: Request) -> RedirectResponse | None:
+    if is_admin_request(request):
+        return None
+    return RedirectResponse(url="/admin/login", status_code=303)
+
+
+async def read_form_fields(request: Request) -> dict[str, str]:
+    body = (await request.body()).decode("utf-8")
+    parsed = parse_qs(body, keep_blank_values=True)
+    return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def json_pretty(value: Any) -> str:
+    return json.dumps(value, indent=2, sort_keys=True, default=str)
 
 
 def _configured_public_key() -> str | None:
@@ -359,12 +414,242 @@ def append_insight(record: dict[str, Any]) -> None:
             conn.close()
 
 
+def store_insight(payload: dict[str, Any], auth_metadata: dict[str, Any] | None = None, path: str = "/telnyx/insights") -> dict[str, Any]:
+    insight_id = uuid.uuid4().hex
+    record = {
+        "id": insight_id,
+        "received_at": utc_now(),
+        "path": path,
+        **(auth_metadata or {}),
+        "payload": payload,
+    }
+    append_insight(record)
+    return record
+
+
+def get_insight_by_id(insight_id: str) -> dict[str, Any] | None:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            row = conn.execute("SELECT data FROM insights WHERE id = ?", (insight_id,)).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    try:
+        parsed = json.loads(row["data"])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    inner = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    event_type = data.get("event_type") or payload.get("event_type") or inner.get("event_type") or "unknown"
+    summary = first_present(inner.get("summary"), inner.get("intent"), payload.get("summary"), data.get("summary")) or "No summary found"
+    return {
+        "id": record.get("id"),
+        "received_at": record.get("received_at"),
+        "event_type": event_type,
+        "assistant_id": first_present(inner.get("assistant_id"), data.get("assistant_id"), payload.get("assistant_id")),
+        "conversation_id": first_present(inner.get("conversation_id"), data.get("conversation_id"), payload.get("conversation_id")),
+        "caller": first_present(inner.get("from"), payload.get("from"), inner.get("caller"), payload.get("caller")),
+        "signature_verified": bool(record.get("telnyx_signature_verified")),
+        "shared_secret_verified": bool(record.get("shared_secret_verified")),
+        "summary": str(summary)[:220],
+    }
+
+
+def list_insight_summaries(limit: int = 50, q: str = "") -> list[dict[str, Any]]:
+    summaries = [extract_insight_fields(record) for record in read_insights()]
+    if q:
+        needle = q.lower()
+        summaries = [item for item in summaries if needle in json.dumps(item, default=str).lower()]
+    return summaries[-max(1, min(limit, 200)):][::-1]
+
+
+def get_insight_stats() -> dict[str, Any]:
+    insights = read_insights()
+    signature_verified = 0
+    shared_secret_verified = 0
+    latest_received_at = None
+    for record in insights:
+        if record.get("telnyx_signature_verified"):
+            signature_verified += 1
+        if record.get("shared_secret_verified"):
+            shared_secret_verified += 1
+        latest_received_at = record.get("received_at") or latest_received_at
+    return {
+        "ok": True,
+        "service": "miswitch-telnyx-webhook",
+        "db_path": str(DB_PATH),
+        "insight_count": len(insights),
+        "latest_received_at": latest_received_at,
+        "signature_verified_count": signature_verified,
+        "shared_secret_verified_count": shared_secret_verified,
+    }
+
+
 init_db()
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"ok": True, "service": "miswitch-telnyx-webhook", "host": "webhook.miswitch.cloud"}
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(request, "admin_login.html", {"error": None})
+
+
+@app.post("/admin/login", response_class=HTMLResponse)
+async def admin_login(request: Request):
+    fields = await read_form_fields(request)
+    if not _secret_matches(fields.get("secret")):
+        return templates.TemplateResponse(request, "admin_login.html", {"error": "Invalid shared secret"}, status_code=401)
+    response = RedirectResponse(url="/admin", status_code=303)
+    response.set_cookie(
+        "admin_session",
+        make_admin_session(),
+        max_age=60 * 60 * 12,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+    )
+    return response
+
+
+@app.post("/admin/logout")
+def admin_logout() -> RedirectResponse:
+    response = RedirectResponse(url="/admin/login", status_code=303)
+    response.delete_cookie("admin_session")
+    return response
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(request: Request):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    stats = get_insight_stats()
+    recent = list_insight_summaries(limit=10)
+    return templates.TemplateResponse(request, "admin_dashboard.html", {"stats": stats, "recent": recent})
+
+
+@app.get("/admin/api/stats")
+def admin_api_stats(request: Request):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    return get_insight_stats()
+
+
+@app.get("/admin/insights", response_class=HTMLResponse)
+def admin_insights_page(request: Request, q: str = "", limit: int = Query(default=50, ge=1, le=200)):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    insights = list_insight_summaries(limit=limit, q=q)
+    return templates.TemplateResponse(request, "admin_insights.html", {"insights": insights, "q": q, "limit": limit})
+
+
+@app.get("/admin/api/insights")
+def admin_api_insights(request: Request, q: str = "", limit: int = Query(default=50, ge=1, le=200)):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    insights = list_insight_summaries(limit=limit, q=q)
+    return {"count": len(insights), "insights": insights}
+
+
+@app.get("/admin/insights/{insight_id}", response_class=HTMLResponse)
+def admin_insight_detail_page(request: Request, insight_id: str):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    record = get_insight_by_id(insight_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Insight not found")
+    fields = extract_insight_fields(record)
+    return templates.TemplateResponse(
+        request,
+        "admin_insight_detail.html",
+        {"record": record, "fields": fields, "pretty_json": json_pretty(record)},
+    )
+
+
+@app.get("/admin/api/insights/{insight_id}")
+def admin_api_insight_detail(request: Request, insight_id: str):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    record = get_insight_by_id(insight_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Insight not found")
+    return record
+
+
+@app.get("/admin/tools/assistant-init", response_class=HTMLResponse)
+def admin_assistant_init_page(request: Request):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    sample = json_pretty({"data": {"payload": {"telnyx_end_user_target": "+12485550199", "telnyx_agent_target": "+12485550100", "telnyx_conversation_channel": "phone_call"}}})
+    return templates.TemplateResponse(request, "admin_assistant_init.html", {"payload": sample, "result": None, "error": None})
+
+
+@app.post("/admin/tools/assistant-init", response_class=HTMLResponse)
+async def admin_assistant_init_submit(request: Request):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    fields = await read_form_fields(request)
+    payload_text = fields.get("payload", "")
+    try:
+        payload = json.loads(payload_text or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("Top-level JSON must be an object")
+        result = build_assistant_initialization_response(
+            payload,
+            assistant_id_override=fields.get("assistant_id") or None,
+            customer_id_override=fields.get("customer_id") or None,
+            tenant_id_override=fields.get("tenant_id") or None,
+            assistant_family_override=fields.get("assistant_family") or None,
+            environment_override=fields.get("environment") or None,
+        )
+        return templates.TemplateResponse(request, "admin_assistant_init.html", {"payload": payload_text, "result": json_pretty(result), "error": None})
+    except Exception as exc:
+        return templates.TemplateResponse(request, "admin_assistant_init.html", {"payload": payload_text, "result": None, "error": str(exc)}, status_code=400)
+
+
+@app.get("/admin/tools/webhook-simulator", response_class=HTMLResponse)
+def admin_webhook_simulator_page(request: Request):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    sample = json_pretty({"event_type": "conversation_insight_result", "payload": {"summary": "Sample insight from admin simulator"}})
+    return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": sample, "result": None, "error": None})
+
+
+@app.post("/admin/tools/webhook-simulator", response_class=HTMLResponse)
+async def admin_webhook_simulator_submit(request: Request):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    fields = await read_form_fields(request)
+    payload_text = fields.get("payload", "")
+    try:
+        payload = json.loads(payload_text or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("Top-level JSON must be an object")
+        record = store_insight(payload, {"admin_simulated": True, "shared_secret_verified": True}, path="/admin/tools/webhook-simulator")
+        result = {"message": "Stored insight", "id": record["id"], "detail_url": f"/admin/insights/{record['id']}"}
+        return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": json_pretty(result), "error": None})
+    except Exception as exc:
+        return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": None, "error": str(exc)}, status_code=400)
 
 
 @app.post("/telnyx/assistant/init")
@@ -421,19 +706,17 @@ async def receive_telnyx_insights(
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
 
-    insight_id = uuid.uuid4().hex
-    record = {
-        "id": insight_id,
-        "received_at": utc_now(),
-        "path": str(request.url.path),
-        "telnyx_signature_present": bool(telnyx_signature_ed25519),
-        "telnyx_signature_verified": signature_valid,
-        "shared_secret_verified": secret_valid,
-        "telnyx_timestamp": telnyx_timestamp,
-        "payload": payload,
-    }
-    append_insight(record)
-    return {"accepted": True, "id": insight_id}
+    record = store_insight(
+        payload,
+        {
+            "telnyx_signature_present": bool(telnyx_signature_ed25519),
+            "telnyx_signature_verified": signature_valid,
+            "shared_secret_verified": secret_valid,
+            "telnyx_timestamp": telnyx_timestamp,
+        },
+        path=str(request.url.path),
+    )
+    return {"accepted": True, "id": record["id"]}
 
 
 @app.get("/telnyx/insights")

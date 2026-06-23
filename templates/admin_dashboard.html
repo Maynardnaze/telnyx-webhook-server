@@ -1,0 +1,42 @@
+{% extends "admin_base.html" %}
+{% block title %}Dashboard · Telnyx Webhook Admin{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+<section class="cards">
+  <div class="card"><span>Service</span><strong>{{ stats.service }}</strong></div>
+  <div class="card"><span>Insight records</span><strong>{{ stats.insight_count }}</strong></div>
+  <div class="card"><span>Latest received</span><strong>{{ stats.latest_received_at or 'none yet' }}</strong></div>
+  <div class="card"><span>Signature verified</span><strong>{{ stats.signature_verified_count }}</strong></div>
+  <div class="card"><span>Shared-secret fallback</span><strong>{{ stats.shared_secret_verified_count }}</strong></div>
+</section>
+<section class="panel">
+  <h2>Quick actions</h2>
+  <p>
+    <a class="button" href="/admin/insights">View Insights</a>
+    <a class="button" href="/admin/tools/assistant-init">Test Assistant Init</a>
+    <a class="button" href="/admin/tools/webhook-simulator">Simulate Webhook</a>
+    <a class="button secondary" href="/docs">FastAPI Docs</a>
+  </p>
+</section>
+<section class="panel">
+  <h2>Recent insights</h2>
+  {% if recent %}
+  <table>
+    <thead><tr><th>Received</th><th>Type</th><th>Assistant</th><th>Summary</th><th></th></tr></thead>
+    <tbody>
+      {% for item in recent %}
+      <tr>
+        <td>{{ item.received_at }}</td>
+        <td>{{ item.event_type }}</td>
+        <td>{{ item.assistant_id or '' }}</td>
+        <td>{{ item.summary }}</td>
+        <td><a href="/admin/insights/{{ item.id }}">Open</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No insights stored yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

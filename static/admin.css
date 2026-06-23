@@ -1,0 +1,36 @@
+:root { color-scheme: light dark; --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#94a3b8; --line:#334155; --accent:#38bdf8; --danger:#fb7185; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.topbar { display:flex; align-items:center; justify-content:space-between; padding: 0.9rem 1.2rem; border-bottom:1px solid var(--line); background:#020617; position:sticky; top:0; z-index:2; }
+.brand { font-weight: 700; color: var(--text); }
+nav { display:flex; gap:1rem; align-items:center; flex-wrap:wrap; }
+.container { max-width: 1180px; margin: 0 auto; padding: 1.4rem; }
+.panel, .card, .login-card { background: var(--panel); border:1px solid var(--line); border-radius: 14px; padding: 1rem; margin-bottom: 1rem; }
+.cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap:1rem; margin:1rem 0; }
+.card span { color:var(--muted); display:block; font-size:.9rem; margin-bottom:.4rem; }
+.card strong { overflow-wrap:anywhere; }
+table { width:100%; border-collapse: collapse; font-size:.92rem; }
+th, td { padding:.65rem; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+th { color:var(--muted); font-weight:600; }
+pre { overflow:auto; background:#020617; border:1px solid var(--line); padding:1rem; border-radius:10px; }
+button, .button { background:var(--accent); color:#001018; border:0; border-radius:10px; padding:.55rem .85rem; font-weight:700; cursor:pointer; display:inline-block; }
+button.secondary, .button.secondary { background:#475569; color:var(--text); }
+.inline { display:inline; }
+.inline button { background:transparent; border:1px solid var(--line); color:var(--text); }
+input, textarea { width:100%; padding:.65rem; border-radius:10px; border:1px solid var(--line); background:#020617; color:var(--text); }
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+label { display:block; margin:.6rem 0; color:var(--muted); }
+.toolbar { display:flex; gap:.7rem; align-items:end; }
+.toolbar input[type="search"] { flex:1; }
+.stacked { display:grid; gap:.8rem; }
+.grid-two { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:.8rem; }
+.alert { padding:.8rem; border-radius:10px; margin:.8rem 0; }
+.alert.error { background:rgba(251,113,133,.12); border:1px solid var(--danger); color:#fecdd3; }
+.login-page { min-height:100vh; display:grid; place-items:center; padding:1rem; }
+.login-card { width:min(420px, 100%); }
+dl { display:grid; grid-template-columns: 190px 1fr; gap:.5rem 1rem; }
+dt { color:var(--muted); }
+dd { margin:0; overflow-wrap:anywhere; }
+@media (max-width: 720px) { .topbar { align-items:flex-start; flex-direction:column; gap:.7rem; } table { display:block; overflow-x:auto; } dl { grid-template-columns:1fr; } }

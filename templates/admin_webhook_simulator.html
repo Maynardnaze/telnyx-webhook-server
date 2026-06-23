@@ -1,0 +1,19 @@
+{% extends "admin_base.html" %}
+{% block title %}Webhook Simulator · Telnyx Webhook Admin{% endblock %}
+{% block content %}
+<h1>Webhook Simulator</h1>
+<section class="panel">
+  <p>Store a sample insight payload through the same SQLite persistence path used by the Telnyx webhook receiver. No external APIs are called.</p>
+  {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin/tools/webhook-simulator" class="stacked">
+    <label>Payload JSON<textarea name="payload" rows="16">{{ payload }}</textarea></label>
+    <button type="submit">Store simulated insight</button>
+  </form>
+</section>
+{% if result %}
+<section class="panel">
+  <h2>Result</h2>
+  <pre><code>{{ result }}</code></pre>
+</section>
+{% endif %}
+{% endblock %}

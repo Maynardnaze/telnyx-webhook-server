@@ -14,6 +14,7 @@ https://webhook.miswitch.cloud
 - **Verifies Telnyx Ed25519 signatures** when `TELNYX_PUBLIC_KEY` is configured
 - **Stores payloads in SQLite** for later inspection
 - **Exposes a read-only listing** at `GET /telnyx/insights` (shared-secret protected)
+- **Provides a private web admin UI** at `/admin` for browsing insights and testing webhook helpers
 
 The server returns fast `200` acknowledgements so Telnyx does not retry deliveries.
 
@@ -25,7 +26,10 @@ The server returns fast `200` acknowledgements so Telnyx does not retry deliveri
 telnyx-webhook-server/
 ├── app.py                 # FastAPI application
 ├── docs/
+│   ├── plans/             # Implementation plans
 │   └── telnyx-insights.md # Insight Group webhook format and examples
+├── templates/             # Server-rendered admin UI pages
+├── static/                # Admin UI CSS/JS
 ├── docker-compose.yml     # Production Compose stack
 ├── Dockerfile
 ├── data/                  # Runtime data (gitignored except .gitkeep)
@@ -88,6 +92,23 @@ curl -s http://127.0.0.1:8787/telnyx/insights -H 'x-webhook-secret: your-secret'
 ```
 
 Interactive API docs are available at `http://127.0.0.1:8787/docs` while the server is running.
+
+The private admin UI is available at `http://127.0.0.1:8787/admin`. Sign in with the same shared secret used for `x-webhook-secret`. In local development with `WEBHOOK_ALLOW_NO_SECRET=1`, Telnyx endpoints skip auth, but the admin UI still expects the configured shared secret value.
+
+## Admin web UI
+
+The first admin frontend is intentionally simple and served by FastAPI from the same container:
+
+| Route | Purpose |
+|-------|---------|
+| `/admin/login` | Browser login using the webhook shared secret |
+| `/admin` | Dashboard with health, SQLite path, record count, latest delivery, and auth stats |
+| `/admin/insights` | Browse/search recent stored Insight Group records |
+| `/admin/insights/{id}` | Inspect extracted fields and pretty JSON for one record |
+| `/admin/tools/assistant-init` | Test the local Dynamic Variables Webhook response builder |
+| `/admin/tools/webhook-simulator` | Store a sample insight payload without calling external APIs |
+
+Admin sessions use a signed `admin_session` cookie derived from `WEBHOOK_SECRET`; no separate user database is created. Do not expose `/admin/*` to other users until you add stronger auth or path-specific access control such as Authelia/Cloudflare Access. Keep `/telnyx/*` free from browser-style auth challenges so Telnyx can continue posting signed webhooks.
 
 ## Configuration
 

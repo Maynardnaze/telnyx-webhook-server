@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Telnyx Webhook Admin{% endblock %}</title>
+  <link rel="stylesheet" href="/admin/static/admin.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/admin">Telnyx Webhook Admin</a>
+    <nav>
+      <a href="/admin">Dashboard</a>
+      <a href="/admin/insights">Insights</a>
+      <a href="/admin/tools/assistant-init">Assistant Init</a>
+      <a href="/admin/tools/webhook-simulator">Simulator</a>
+      <form method="post" action="/admin/logout" class="inline"><button type="submit">Logout</button></form>
+    </nav>
+  </header>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="/admin/static/admin.js"></script>
+</body>
+</html>

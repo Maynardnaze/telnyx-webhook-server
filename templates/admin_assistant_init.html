@@ -1,0 +1,27 @@
+{% extends "admin_base.html" %}
+{% block title %}Assistant Init Tester · Telnyx Webhook Admin{% endblock %}
+{% block content %}
+<h1>Assistant Init Tester</h1>
+<section class="panel">
+  <p>Paste a Telnyx assistant initialization payload and test the local dynamic variables/memory response.</p>
+  {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin/tools/assistant-init" class="stacked">
+    <div class="grid-two">
+      <label>Assistant ID <input name="assistant_id" placeholder="assistant-..."></label>
+      <label>Customer ID <input name="customer_id" placeholder="customer-slug"></label>
+      <label>Tenant ID <input name="tenant_id" placeholder="optional"></label>
+      <label>Environment <input name="environment" placeholder="prod or test"></label>
+      <label>Assistant family <input name="assistant_family" placeholder="miswitch-ai-assistants"></label>
+    </div>
+    <label>Payload JSON<textarea name="payload" rows="14">{{ payload }}</textarea></label>
+    <button type="submit">Test assistant init</button>
+  </form>
+</section>
+{% if result %}
+<section class="panel">
+  <h2>Response</h2>
+  <button type="button" data-copy-target="assistant-init-result">Copy JSON</button>
+  <pre id="assistant-init-result"><code>{{ result }}</code></pre>
+</section>
+{% endif %}
+{% endblock %}

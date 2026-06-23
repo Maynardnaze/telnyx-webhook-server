@@ -1,0 +1,26 @@
+{% extends "admin_base.html" %}
+{% block title %}Insight {{ fields.id }} · Telnyx Webhook Admin{% endblock %}
+{% block content %}
+<p><a href="/admin/insights">← Back to insights</a></p>
+<h1>Insight {{ fields.id }}</h1>
+<section class="cards">
+  <div class="card"><span>Received</span><strong>{{ fields.received_at }}</strong></div>
+  <div class="card"><span>Event type</span><strong>{{ fields.event_type }}</strong></div>
+  <div class="card"><span>Assistant</span><strong>{{ fields.assistant_id or 'unknown' }}</strong></div>
+  <div class="card"><span>Conversation</span><strong>{{ fields.conversation_id or 'unknown' }}</strong></div>
+</section>
+<section class="panel">
+  <h2>Extracted summary</h2>
+  <dl>
+    <dt>Caller</dt><dd>{{ fields.caller or 'unknown' }}</dd>
+    <dt>Signature verified</dt><dd>{{ fields.signature_verified }}</dd>
+    <dt>Shared-secret verified</dt><dd>{{ fields.shared_secret_verified }}</dd>
+    <dt>Summary</dt><dd>{{ fields.summary }}</dd>
+  </dl>
+</section>
+<section class="panel">
+  <h2>Pretty JSON</h2>
+  <button type="button" data-copy-target="pretty-json">Copy JSON</button>
+  <pre id="pretty-json"><code>{{ pretty_json }}</code></pre>
+</section>
+{% endblock %}

@@ -4,9 +4,11 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-RUN pip install --no-cache-dir fastapi 'uvicorn[standard]' pynacl
+RUN pip install --no-cache-dir fastapi 'uvicorn[standard]' pynacl jinja2
 
 COPY app.py /app/
+COPY templates /app/templates
+COPY static /app/static
 
 RUN mkdir -p /data
 
