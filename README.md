@@ -15,6 +15,7 @@ https://webhook.miswitch.cloud
 - **Stores payloads in SQLite** for later inspection
 - **Exposes a read-only listing** at `GET /telnyx/insights` (shared-secret protected)
 - **Provides a private web admin UI** at `/admin` for browsing insights and testing webhook helpers
+- **Accepts dry-run async tool requests** at `/telnyx/tools/async/{tool_name}` and records Add Messages payloads without external writes
 
 The server returns fast `200` acknowledgements so Telnyx does not retry deliveries.
 
@@ -106,6 +107,7 @@ The first admin frontend is intentionally simple and served by FastAPI from the 
 | `/admin/insights` | Browse/search recent stored Insight Group records |
 | `/admin/insights/{id}` | Inspect extracted fields and pretty JSON for one record |
 | `/admin/tools/assistant-init` | Test the local Dynamic Variables Webhook response builder |
+| `/admin/tools/async-jobs` | Review dry-run async tool jobs and prepared Add Messages payloads |
 | `/admin/tools/webhook-simulator` | Store a sample insight payload without calling external APIs |
 
 Admin sessions use a signed `admin_session` cookie derived from `WEBHOOK_SECRET`; no separate user database is created. Do not expose `/admin/*` to other users until you add stronger auth or path-specific access control such as Authelia/Cloudflare Access. Keep `/telnyx/*` free from browser-style auth challenges so Telnyx can continue posting signed webhooks.
@@ -165,6 +167,12 @@ Insight payloads are stored in a single SQLite file:
 
 The `./data` directory is bind-mounted into the container at `/data`. Back up by copying `data/webhook.db`.
 
+Async tool jobs are stored in the same SQLite database:
+
+| Table | Contents | Purpose |
+|-------|----------|---------|
+| `async_tool_jobs` | Async tool request/response lifecycle | Dry-run queue records and prepared Telnyx Add Messages payloads |
+
 ### Migrating from legacy JSON
 
 Older deployments stored insights in `/data/insights.json`. On first startup, if the SQLite database is empty, the server automatically imports that file once.
@@ -183,6 +191,7 @@ To force a fresh import:
 | `GET /health` | No | — |
 | `POST /telnyx/insights` | Yes | Telnyx Ed25519 signature **or** shared secret |
 | `GET /telnyx/insights` | Yes | Shared secret header or `?secret=` query param |
+| `POST /telnyx/tools/async/{tool_name}` | Yes | Shared secret header or `?secret=` query param, plus `x-telnyx-call-control-id` |
 
 Do **not** put OAuth, Authelia, or Cloudflare Access in front of this route unless Telnyx can satisfy that challenge. Use Telnyx signature verification and the shared secret for app-level protection instead.
 
@@ -379,6 +388,46 @@ middleware: chain-no-auth@file
 | `401` on `GET /telnyx/insights` | Wrong or missing secret | `secrets/telnyx_webhook_secret` and request header |
 | Empty insight list | No deliveries yet | `docker logs telnyx-webhook-server` during a call |
 | Database permission errors | `data/` not writable | `mkdir -p data` and check volume mount permissions |
+
+### `POST /telnyx/tools/async/{tool_name}`
+
+Dry-run receiver for Telnyx AI Assistant async webhook tools. It returns a fast acknowledgement, persists a background job in SQLite, and records the Telnyx Add Messages payload that would be sent back into the live conversation. It does **not** call Telnyx or any external system yet.
+
+Required:
+
+- `x-webhook-secret: <secret>` or `?secret=<secret>`
+- `x-telnyx-call-control-id: <call_control_id>`
+- JSON object body
+
+Example:
+
+```bash
+SECRET="$(cat secrets/telnyx_webhook_secret)"
+
+curl -s https://webhook.miswitch.cloud/telnyx/tools/async/order-status \
+  -H "content-type: application/json" \
+  -H "x-webhook-secret: $SECRET" \
+  -H "x-telnyx-call-control-id: demo-call-control-123" \
+  -d '{"order_id":"TEST-42","customer":{"phone":"+12485550199"}}'
+```
+
+Example ACK:
+
+```json
+{
+  "ok": true,
+  "mode": "async_ack_dry_run",
+  "job_id": "...",
+  "ack_ms": 1.23,
+  "message": "Accepted. Background work queued; inspect /admin/tools/async-jobs for dry-run Add Messages payload."
+}
+```
+
+Review jobs in the admin UI:
+
+```text
+https://webhook.miswitch.cloud/admin/tools/async-jobs
+```
 
 ## License
 

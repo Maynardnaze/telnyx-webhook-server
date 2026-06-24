@@ -1,0 +1,29 @@
+{% extends "admin_base.html" %}
+{% block title %}Async Tool Jobs · Telnyx Webhook Admin{% endblock %}
+{% block content %}
+<h1>Async Tool Jobs</h1>
+<section class="panel">
+  <p>Dry-run Telnyx AI Assistant async webhook tool jobs. These records prepare the Add Messages payload that would be sent back to the live conversation; no Telnyx API write is performed.</p>
+  <p><code>POST /telnyx/tools/async/order-status</code> with <code>x-telnyx-call-control-id</code> and <code>x-webhook-secret</code>.</p>
+</section>
+<section class="panel">
+  {% if jobs %}
+  <table>
+    <thead><tr><th>Received</th><th>Tool</th><th>Status</th><th>Call Control ID</th><th>Result / Dry-run Add Messages</th></tr></thead>
+    <tbody>
+      {% for job in jobs %}
+      <tr>
+        <td>{{ job.received_at }}</td>
+        <td>{{ job.tool_name }}</td>
+        <td>{{ job.status }}</td>
+        <td>{{ job.call_control_id }}</td>
+        <td><pre><code>{{ job.add_messages_dry_run or job.result_data or job.error or '' }}</code></pre></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p>No async tool jobs yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

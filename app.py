@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -186,6 +186,21 @@ def init_db() -> None:
                     data TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_insights_received_at ON insights(received_at);
+
+                CREATE TABLE IF NOT EXISTS async_tool_jobs (
+                    id TEXT PRIMARY KEY,
+                    tool_name TEXT NOT NULL,
+                    call_control_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    request_data TEXT NOT NULL,
+                    result_data TEXT,
+                    add_messages_dry_run TEXT,
+                    error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_async_tool_jobs_received_at ON async_tool_jobs(received_at);
+                CREATE INDEX IF NOT EXISTS idx_async_tool_jobs_status ON async_tool_jobs(status);
                 """
             )
             conn.commit()
@@ -414,6 +429,175 @@ def append_insight(record: dict[str, Any]) -> None:
             conn.close()
 
 
+def redact_phone(value: Any) -> Any:
+    if not isinstance(value, str) or len(value) < 7:
+        return value
+    if value.startswith("+") and value[1:].isdigit():
+        return value[:3] + "***" + value[-2:]
+    return value
+
+
+def summarize_order_status(body: dict[str, Any]) -> dict[str, Any]:
+    customer = body.get("customer") or body.get("caller") or {}
+    order_id = body.get("order_id") or body.get("orderId") or body.get("case_id") or "DEMO-1001"
+    caller = redact_phone(customer.get("phone") if isinstance(customer, dict) else body.get("from"))
+    return {
+        "order_id": order_id,
+        "status": "ready_for_pickup",
+        "eta_minutes": 0,
+        "caller": caller,
+        "confidence": "dry_run_mock",
+        "note": "Dry-run result generated locally. Replace this lookup with n8n/Tripleseat/Zoho/NetSapiens logic before live sends.",
+    }
+
+
+def create_async_tool_job(tool_name: str, call_control_id: str, request_body: dict[str, Any]) -> dict[str, Any]:
+    job = {
+        "id": uuid.uuid4().hex,
+        "tool_name": tool_name,
+        "call_control_id": call_control_id,
+        "status": "queued",
+        "received_at": utc_now(),
+        "completed_at": None,
+        "request_data": request_body,
+        "result_data": None,
+        "add_messages_dry_run": None,
+        "error": None,
+    }
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO async_tool_jobs
+                (id, tool_name, call_control_id, status, received_at, completed_at, request_data, result_data, add_messages_dry_run, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job["id"],
+                    job["tool_name"],
+                    job["call_control_id"],
+                    job["status"],
+                    job["received_at"],
+                    job["completed_at"],
+                    json.dumps(request_body, separators=(",", ":")),
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return job
+
+
+def _decode_job_row(row: sqlite3.Row) -> dict[str, Any]:
+    def maybe_json(value: str | None) -> Any:
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+
+    return {
+        "id": row["id"],
+        "tool_name": row["tool_name"],
+        "call_control_id": row["call_control_id"],
+        "status": row["status"],
+        "received_at": row["received_at"],
+        "completed_at": row["completed_at"],
+        "request_data": maybe_json(row["request_data"]),
+        "result_data": maybe_json(row["result_data"]),
+        "add_messages_dry_run": maybe_json(row["add_messages_dry_run"]),
+        "error": row["error"],
+    }
+
+
+def get_async_tool_job(job_id: str) -> dict[str, Any] | None:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            row = conn.execute("SELECT * FROM async_tool_jobs WHERE id = ?", (job_id,)).fetchone()
+        finally:
+            conn.close()
+    return _decode_job_row(row) if row else None
+
+
+def list_async_tool_jobs(limit: int = 50) -> list[dict[str, Any]]:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM async_tool_jobs ORDER BY received_at DESC LIMIT ?",
+                (max(1, min(limit, 200)),),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [_decode_job_row(row) for row in rows]
+
+
+def run_async_tool_job(job_id: str) -> None:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute("UPDATE async_tool_jobs SET status = ? WHERE id = ?", ("running", job_id))
+            conn.commit()
+        finally:
+            conn.close()
+    job = get_async_tool_job(job_id)
+    if not job:
+        return
+    try:
+        if job["tool_name"] == "order-status":
+            result = summarize_order_status(job["request_data"] or {})
+            content = (
+                f"Background lookup complete for order {result['order_id']}: "
+                f"status={result['status']}, eta={result['eta_minutes']} minutes."
+            )
+        else:
+            result = {
+                "tool_name": job["tool_name"],
+                "status": "received",
+                "confidence": "dry_run_mock",
+                "note": "Generic dry-run async tool result. Add real lookup logic before live sends.",
+            }
+            content = f"Background tool {job['tool_name']} completed in dry-run mode."
+        add_messages = {
+            "call_control_id": job["call_control_id"],
+            "messages": [{"role": "system", "content": content}],
+        }
+        status = "complete"
+        error = None
+    except Exception as exc:  # pragma: no cover - defensive background path
+        result = None
+        add_messages = None
+        status = "error"
+        error = repr(exc)
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute(
+                """
+                UPDATE async_tool_jobs
+                SET status = ?, completed_at = ?, result_data = ?, add_messages_dry_run = ?, error = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    utc_now(),
+                    json.dumps(result, separators=(",", ":")) if result is not None else None,
+                    json.dumps(add_messages, separators=(",", ":")) if add_messages is not None else None,
+                    error,
+                    job_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
 def store_insight(payload: dict[str, Any], auth_metadata: dict[str, Any] | None = None, path: str = "/telnyx/insights") -> dict[str, Any]:
     insight_id = uuid.uuid4().hex
     record = {
@@ -592,6 +776,24 @@ def admin_api_insight_detail(request: Request, insight_id: str):
     return record
 
 
+@app.get("/admin/tools/async-jobs", response_class=HTMLResponse)
+def admin_async_jobs_page(request: Request, limit: int = Query(default=50, ge=1, le=200)):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    jobs = list_async_tool_jobs(limit=limit)
+    return templates.TemplateResponse(request, "admin_async_jobs.html", {"jobs": jobs})
+
+
+@app.get("/admin/api/async-jobs")
+def admin_api_async_jobs(request: Request, limit: int = Query(default=50, ge=1, le=200)):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    jobs = list_async_tool_jobs(limit=limit)
+    return {"count": len(jobs), "jobs": jobs}
+
+
 @app.get("/admin/tools/assistant-init", response_class=HTMLResponse)
 def admin_assistant_init_page(request: Request):
     redirect = require_admin_response(request)
@@ -650,6 +852,35 @@ async def admin_webhook_simulator_submit(request: Request):
         return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": json_pretty(result), "error": None})
     except Exception as exc:
         return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": None, "error": str(exc)}, status_code=400)
+
+
+@app.post("/telnyx/tools/async/{tool_name}")
+async def receive_async_tool_request(
+    tool_name: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    x_telnyx_call_control_id: str | None = Header(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    check_secret(x_webhook_secret, request.query_params.get("secret"))
+    if not x_telnyx_call_control_id:
+        raise HTTPException(status_code=400, detail="Missing x-telnyx-call-control-id header")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    started = time.perf_counter()
+    job = create_async_tool_job(tool_name=tool_name, call_control_id=x_telnyx_call_control_id, request_body=payload)
+    background_tasks.add_task(run_async_tool_job, job["id"])
+    return {
+        "ok": True,
+        "mode": "async_ack_dry_run",
+        "job_id": job["id"],
+        "ack_ms": round((time.perf_counter() - started) * 1000, 2),
+        "message": "Accepted. Background work queued; inspect /admin/tools/async-jobs for dry-run Add Messages payload.",
+    }
 
 
 @app.post("/telnyx/assistant/init")
