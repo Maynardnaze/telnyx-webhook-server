@@ -16,11 +16,12 @@ services:
       ASSISTANT_MEMORY_LIMIT: ${ASSISTANT_MEMORY_LIMIT:-5}
       ASSISTANT_MEMORY_INSIGHT_QUERY: ${ASSISTANT_MEMORY_INSIGHT_QUERY:-}
       ASSISTANT_MEMORY_PROFILES: ${ASSISTANT_MEMORY_PROFILES:-}
-    secrets:
-      - telnyx_webhook_secret
-      - telnyx_api_key
     volumes:
       - ./data:/data
+      # Mount the secrets directory instead of individual secret files so the
+      # container can start even if optional secrets (for example Telnyx API key
+      # used only by outbound SMS tools) have not been created yet.
+      - ./secrets:/run/secrets:ro
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=t3_proxy"
@@ -34,9 +35,3 @@ services:
 networks:
   t3_proxy:
     external: true
-
-secrets:
-  telnyx_webhook_secret:
-    file: ./secrets/telnyx_webhook_secret
-  telnyx_api_key:
-    file: ./secrets/telnyx_api_key
