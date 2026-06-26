@@ -1,35 +1,82 @@
 {% extends "admin_base.html" %}
-{% block title %}Insights · Telnyx Webhook Admin{% endblock %}
+{% block title %}Insights · Miswitch Insights Console{% endblock %}
+{% block page_title %}Insights{% endblock %}
+{% block page_subtitle %}MySwitch deliveries{% endblock %}
 {% block content %}
-<h1>Insights</h1>
-<section class="panel">
-  <form method="get" action="/admin/insights" class="toolbar">
-    <input type="search" name="q" value="{{ q }}" placeholder="Search summary, assistant, caller...">
-    <input type="number" name="limit" value="{{ limit }}" min="1" max="200">
-    <button type="submit">Filter</button>
+<div data-client-filter>
+<div class="filter-bar">
+  <form method="get" action="/admin/insights" class="search-box" id="insights-search-visible">
+    <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4-4"></path></svg>
+    <input type="search" name="q" value="{{ q }}" data-filter-input placeholder="search summary, assistant, caller…">
+    <input type="hidden" name="limit" value="{{ limit }}">
   </form>
-</section>
-<section class="panel">
-  {% if insights %}
-  <table>
-    <thead><tr><th>Received</th><th>Type</th><th>Assistant</th><th>Conversation</th><th>Caller</th><th>Auth</th><th>Summary</th><th></th></tr></thead>
-    <tbody>
+
+  <div class="segment-group" data-segment-group data-segment="channel">
+    <button type="button" class="segment-btn active" data-value="all">all chan</button>
+    <button type="button" class="segment-btn" data-value="phone">phone</button>
+    <button type="button" class="segment-btn" data-value="sms">sms</button>
+  </div>
+
+  <div class="segment-group" data-segment-group data-segment="resolution">
+    <button type="button" class="segment-btn active" data-value="all">all res</button>
+    <button type="button" class="segment-btn" data-value="resolved">resolved</button>
+    <button type="button" class="segment-btn" data-value="transferred">transfer</button>
+    <button type="button" class="segment-btn" data-value="unresolved">unresolved</button>
+  </div>
+
+  <div class="segment-group" data-segment-group data-segment="sentiment">
+    <button type="button" class="segment-btn active" data-value="all">all sent</button>
+    <button type="button" class="segment-btn" data-value="Positive">positive</button>
+    <button type="button" class="segment-btn" data-value="Neutral">neutral</button>
+    <button type="button" class="segment-btn" data-value="Negative">negative</button>
+  </div>
+
+  <button type="submit" class="secondary" form="insights-search-visible">Apply server search</button>
+</div>
+
+<div class="data-table">
+  <div class="data-table-inner">
+    <div class="data-head">
+      <div class="col-flag"></div>
+      <div class="col-time">Received</div>
+      <div class="col-chan">Chan</div>
+      <div class="col-assistant">Assistant</div>
+      <div class="col-caller">Caller</div>
+      <div class="col-resolution">Resolution</div>
+      <div class="col-sentiment">Sentiment</div>
+      <div class="col-summary">Summary</div>
+      <div class="col-review">Review</div>
+      <div class="col-arrow"></div>
+    </div>
+    {% if insights %}
       {% for item in insights %}
-      <tr>
-        <td>{{ item.received_at }}</td>
-        <td>{{ item.event_type }}</td>
-        <td>{{ item.assistant_id or '' }}</td>
-        <td>{{ item.conversation_id or '' }}</td>
-        <td>{{ item.caller or '' }}</td>
-        <td>{% if item.signature_verified %}signature{% elif item.shared_secret_verified %}secret{% else %}unknown{% endif %}</td>
-        <td>{{ item.summary }}</td>
-        <td><a href="/admin/insights/{{ item.id }}">Open</a></td>
-      </tr>
+      <a class="data-row" href="/admin/insights/{{ item.id }}" data-filter-item data-row-id="{{ item.id }}"
+         data-filter-text="{{ item.caller_name or '' }} {{ item.caller_phone or '' }} {{ item.summary or '' }} {{ item.intent_name or '' }} {{ item.primary_category or '' }} {{ item.conversation_id or '' }} {{ item.assistant_id or '' }}"
+         data-channel="{{ item.channel_short or '' }}"
+         data-resolution="{{ item.resolution_key or '' }}"
+         data-sentiment="{{ item.sentiment_label or '' }}"
+         data-flagged="{{ '1' if item.resolution_key in ['unresolved', 'transferred'] or item.sentiment_label == 'Negative' else '0' }}"
+         data-review-default="new"
+         style="text-decoration:none; color:inherit;">
+        <div class="col-flag" data-row-flag style="visibility:{% if item.resolution_key in ['unresolved', 'transferred'] or item.sentiment_label == 'Negative' %}visible{% else %}hidden{% endif %};">⚑</div>
+        <div class="col-time">{{ item.received_at_short }}</div>
+        <div class="col-chan"><span class="pill {{ item.channel_short }}">{{ item.channel_short }}</span></div>
+        <div class="col-assistant">
+          <div class="assistant-name">{{ item.assistant_short or 'Unknown assistant' }}</div>
+          <div class="assistant-id">{{ item.assistant_id or '—' }}</div>
+        </div>
+        <div class="col-caller">{{ item.caller_phone or item.caller_name or '—' }}</div>
+        <div class="col-resolution"><span class="pill {{ item.resolution_key or 'unresolved' }}">{{ item.resolution_status or '—' }}</span></div>
+        <div class="col-sentiment" style="color:{% if item.sentiment_label == 'Positive' %}var(--accent){% elif item.sentiment_label == 'Negative' %}var(--danger){% else %}var(--muted-4){% endif %};">{{ item.sentiment_label or '—' }}</div>
+        <div class="col-summary">{{ item.summary }}</div>
+        <div class="col-review"><span class="pill review-new" data-review-id="{{ item.id }}">New</span></div>
+        <div class="col-arrow">→</div>
+      </a>
       {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <p>No matching insights.</p>
-  {% endif %}
-</section>
+    {% else %}
+      <div class="empty-state">No conversations matched your search.</div>
+    {% endif %}
+  </div>
+</div>
+</div>
 {% endblock %}

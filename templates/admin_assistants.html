@@ -1,0 +1,26 @@
+{% extends "admin_base.html" %}
+{% block title %}Assistants · Miswitch Insights Console{% endblock %}
+{% block page_title %}Assistants{% endblock %}
+{% block page_subtitle %}Grouped by assistant_id{% endblock %}
+{% block content %}
+<p class="page-copy">Derived rollup grouped by <code>assistant_id</code> — click to filter Insights.</p>
+
+{% if assistants %}
+<div class="assistant-grid">
+  {% for item in assistants %}
+  <a class="assistant-card" href="/admin/insights?q={{ item.assistant_id|urlencode }}">
+    <h3>{{ item.assistant_short }}</h3>
+    <div class="id-line">{{ item.assistant_id }}</div>
+    <div class="assistant-stats">
+      <div><span>deliveries</span><strong>{{ item.count }}</strong></div>
+      <div><span>phone</span><strong>{{ item.phone_count }}</strong></div>
+      <div><span>sms</span><strong>{{ item.sms_count }}</strong></div>
+      <div><span>resolved</span><strong>{{ item.resolved_count }}</strong></div>
+    </div>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">No assistant deliveries stored yet.</div>
+{% endif %}
+{% endblock %}

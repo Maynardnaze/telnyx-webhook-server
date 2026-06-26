@@ -3,23 +3,82 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}Telnyx Webhook Admin{% endblock %}</title>
+  <title>{% block title %}Miswitch Insights Console{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/admin/static/admin.css">
 </head>
 <body>
-  <header class="topbar">
-    <a class="brand" href="/admin">Telnyx Webhook Admin</a>
-    <nav>
-      <a href="/admin">Dashboard</a>
-      <a href="/admin/insights">Insights</a>
-      <a href="/admin/tools/assistant-init">Assistant Init</a>
-      <a href="/admin/tools/webhook-simulator">Simulator</a>
-      <form method="post" action="/admin/logout" class="inline"><button type="submit">Logout</button></form>
-    </nav>
-  </header>
-  <main class="container">
-    {% block content %}{% endblock %}
-  </main>
+  <div class="console-shell">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-mark">M</div>
+        <div class="brand-copy">
+          <div class="brand-title">Miswitch</div>
+          <div class="brand-subtitle">insights console</div>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <div class="nav-label">Monitor</div>
+        <a class="nav-link{% if active_page == 'dashboard' %} active{% endif %}" href="/admin">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="9"></rect><rect x="14" y="3" width="7" height="5"></rect><rect x="14" y="12" width="7" height="9"></rect><rect x="3" y="16" width="7" height="5"></rect></svg>
+          Dashboard
+        </a>
+        <a class="nav-link{% if active_page == 'insights' %} active{% endif %}" href="/admin/insights">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18M3 12h18M3 19h12"></path></svg>
+          <span style="flex:1;">Insights</span>
+          {% if console_stats %}<span class="nav-badge">{{ console_stats.insight_count }}</span>{% endif %}
+        </a>
+        <a class="nav-link{% if active_page == 'assistants' %} active{% endif %}" href="/admin/assistants">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="11" rx="2"></rect><path d="M12 8V4M8 14h.01M16 14h.01"></path></svg>
+          Assistants
+        </a>
+
+        <div class="nav-label">Operate</div>
+        <a class="nav-link{% if active_page == 'assistant-init' or active_page == 'simulator' %} active{% endif %}" href="/admin/tools/assistant-init">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17v3h3l5.3-5.3a4 4 0 0 0 5.4-5.4l-2.3 2.3-2-2 2.3-2.3z"></path></svg>
+          Tools
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="health-card">
+          <div class="health-head">
+            <span class="health-dot{% if console_stats and console_stats.insight_count %} live{% endif %}"></span>
+            Ingestion healthy
+          </div>
+          <div class="health-meta">
+            webhook.miswitch.cloud<br>
+            Ed25519 · SQLite store
+            {% if console_stats and console_stats.latest_received_at_display %}<br>Latest: {{ console_stats.latest_received_at_display }}{% endif %}
+          </div>
+        </div>
+        <form method="post" action="/admin/logout" style="margin-top:10px;">
+          <button type="submit" class="ghost full-width">Sign out</button>
+        </form>
+      </div>
+    </aside>
+
+    <div class="main-column">
+      <header class="topbar">
+        <div class="topbar-title">{% block page_title %}Console{% endblock %}</div>
+        <div class="topbar-sub">{% block page_subtitle %}{% endblock %}</div>
+        <div class="topbar-right">
+          {% block topbar_actions %}
+          <div class="env-badge">
+            <span>env</span>
+            <span>prod</span>
+          </div>
+          {% endblock %}
+        </div>
+      </header>
+      <main class="main-panel">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
   <script src="/admin/static/admin.js"></script>
 </body>
 </html>

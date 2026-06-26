@@ -1,26 +1,117 @@
 {% extends "admin_base.html" %}
-{% block title %}Insight {{ fields.id }} · Telnyx Webhook Admin{% endblock %}
+{% block title %}Conversation · Miswitch Insights Console{% endblock %}
+{% block page_title %}Conversation{% endblock %}
+{% block page_subtitle %}{{ fields.id }}{% endblock %}
+{% block topbar_actions %}
+<button type="button" class="secondary" data-copy-target="pretty-json">Copy JSON</button>
+{% endblock %}
 {% block content %}
-<p><a href="/admin/insights">← Back to insights</a></p>
-<h1>Insight {{ fields.id }}</h1>
-<section class="cards">
-  <div class="card"><span>Received</span><strong>{{ fields.received_at }}</strong></div>
-  <div class="card"><span>Event type</span><strong>{{ fields.event_type }}</strong></div>
-  <div class="card"><span>Assistant</span><strong>{{ fields.assistant_id or 'unknown' }}</strong></div>
-  <div class="card"><span>Conversation</span><strong>{{ fields.conversation_id or 'unknown' }}</strong></div>
-</section>
-<section class="panel">
-  <h2>Extracted summary</h2>
-  <dl>
-    <dt>Caller</dt><dd>{{ fields.caller or 'unknown' }}</dd>
-    <dt>Signature verified</dt><dd>{{ fields.signature_verified }}</dd>
-    <dt>Shared-secret verified</dt><dd>{{ fields.shared_secret_verified }}</dd>
-    <dt>Summary</dt><dd>{{ fields.summary }}</dd>
-  </dl>
-</section>
-<section class="panel">
-  <h2>Pretty JSON</h2>
-  <button type="button" data-copy-target="pretty-json">Copy JSON</button>
-  <pre id="pretty-json"><code>{{ pretty_json }}</code></pre>
-</section>
+<a class="back-link" href="/admin/insights">← Insights</a>
+
+<div class="detail-header">
+  <h1>{{ fields.caller_name or fields.caller_phone or 'Conversation detail' }}</h1>
+  <span class="pill {{ fields.channel_short }}">{{ fields.channel_short }}</span>
+  {% if fields.resolution_status %}<span class="pill {{ fields.resolution_key }}">{{ fields.resolution_status }}</span>{% endif %}
+  {% if fields.sentiment_label %}<span class="pill" style="color:{% if fields.sentiment_label == 'Positive' %}var(--accent){% elif fields.sentiment_label == 'Negative' %}var(--danger){% else %}var(--muted-4){% endif %}; border-color:currentColor;">{{ fields.sentiment_label }}</span>{% endif %}
+</div>
+
+<div class="detail-layout">
+  <div>
+    <section class="panel">
+      <div class="section-label">Conversation metadata</div>
+      <div class="meta-rows">
+        <div class="meta-row"><span class="key">assistant_id</span><span class="val">{{ fields.assistant_id or '—' }}</span></div>
+        <div class="meta-row"><span class="key">channel</span><span class="val">{{ fields.channel_label }}</span></div>
+        <div class="meta-row"><span class="key">end_user → agent</span><span class="val">{{ fields.caller_phone or '—' }} → {{ fields.agent_phone or '—' }}</span></div>
+        <div class="meta-row"><span class="key">conversation_id</span><span class="val">{{ fields.conversation_id or '—' }}</span></div>
+        <div class="meta-row"><span class="key">received_at</span><span class="val">{{ fields.received_at_display }}</span></div>
+        <div class="meta-row"><span class="key">auth</span><span class="val">{% if fields.signature_verified %}signature_verified{% elif fields.shared_secret_verified %}shared_secret{% else %}unknown{% endif %}</span></div>
+        {% if fields.called_tools %}
+        <div class="meta-row">
+          <span class="key">called_tools</span>
+          <span class="val"><span class="chip-list">{% for tool in fields.called_tools %}<span class="chip">{{ tool }}</span>{% endfor %}</span></span>
+        </div>
+        {% endif %}
+      </div>
+    </section>
+
+    <div>
+      <div class="section-label">Extracted insights · results[] → MySwitch</div>
+      <div class="insight-grid">
+        {% for item in parsed_results %}
+        <article class="insight-card{% if item.key == 'summary' %} wide{% endif %}">
+          <div class="insight-card-head">
+            <h3>{{ ['①','②','③','④','⑤'][loop.index0] }} {{ item.name }}</h3>
+            <span class="format">{{ item.format }}</span>
+          </div>
+          <div class="insight-body">
+            {% if item.key == 'caller_identity' and item.value is mapping %}
+            <dl class="insight-kv">
+              <div class="kv-row"><dt>First name</dt><dd>{{ item.value.get('caller_first_name') or '—' }}</dd></div>
+              <div class="kv-row"><dt>Last name</dt><dd>{{ item.value.get('caller_last_name') or '—' }}</dd></div>
+            </dl>
+            {% elif item.key == 'sentiment_v2' and item.value is mapping %}
+            <dl class="insight-kv">
+              <div class="kv-row"><dt>Sentiment</dt><dd>{{ item.value.get('sentiment', {}).get('label', '—') }} ({{ item.value.get('sentiment', {}).get('score', '—') }})</dd></div>
+              <div class="kv-row"><dt>Intent</dt><dd>{{ item.value.get('intent', {}).get('name', '—') }} · {{ item.value.get('intent', {}).get('confidence', '—') }}</dd></div>
+              <div class="kv-row"><dt>Explanation</dt><dd>{{ item.value.get('explanation', '—') }}</dd></div>
+            </dl>
+            {% if item.value.get('key_factors') %}
+            <div class="chip-list" style="margin-top:0.7rem;">
+              {% for factor in item.value.get('key_factors', []) %}<span class="chip">{{ factor }}</span>{% endfor %}
+            </div>
+            {% endif %}
+            {% elif item.key == 'call_category' and item.value is mapping %}
+            <dl class="insight-kv">
+              <div class="kv-row"><dt>Category</dt><dd>{{ item.value.primary_category or '—' }}</dd></div>
+              <div class="kv-row"><dt>Issue</dt><dd>{{ item.value.issue_description or '—' }}</dd></div>
+            </dl>
+            {% elif item.key == 'resolution_status' and item.value is mapping %}
+            <dl class="insight-kv">
+              <div class="kv-row"><dt>Status</dt><dd>{{ item.value.resolution_status or item.value.Status or '—' }}</dd></div>
+              <div class="kv-row"><dt>Reason</dt><dd>{{ item.value.transfer_reason or item.value.get('Primary Reason') or '—' }}</dd></div>
+              <div class="kv-row"><dt>Resolved by agent</dt><dd>{{ item.value.resolved_by_agent if item.value.resolved_by_agent is not none else '—' }}</dd></div>
+            </dl>
+            {% elif item.key == 'summary' %}
+            {{ item.pretty }}
+            {% elif item.format == 'json' %}
+            <pre class="compact"><code>{{ item.pretty }}</code></pre>
+            {% else %}
+            {{ item.pretty }}
+            {% endif %}
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <section class="panel review-panel" data-review-panel data-insight-id="{{ fields.id }}">
+      <div class="section-label">Review</div>
+      <div class="review-grid" data-review-status-grid></div>
+      <div class="section-label" style="margin-top:16px; margin-bottom:10px;">Labels</div>
+      <div class="label-grid" data-review-label-grid></div>
+      <div class="review-note" data-review-note">persisted locally</div>
+    </section>
+
+    <section class="panel">
+      <div class="section-label">Server envelope</div>
+      <div class="meta-rows">
+        <div class="meta-row"><span class="key">received_at</span><span class="val">{{ fields.received_at_display }}</span></div>
+        <div class="meta-row"><span class="key">signature_verified</span><span class="val" style="color:{% if fields.signature_verified %}var(--accent){% else %}var(--danger){% endif %};">{{ fields.signature_verified }}</span></div>
+        <div class="meta-row"><span class="key">shared_secret</span><span class="val">{{ fields.shared_secret_verified }}</span></div>
+        <div class="meta-row"><span class="key">insight_group_id</span><span class="val">{{ fields.insight_group_id or myswitch_group_short }}</span></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head" style="margin-bottom:11px;">
+        <span class="section-label" style="margin:0;">Raw JSON</span>
+        <button type="button" class="secondary" data-toggle-target="pretty-json" style="margin-left:auto;">Toggle</button>
+      </div>
+      <pre id="pretty-json" class="compact" hidden><code>{{ pretty_json }}</code></pre>
+    </section>
+  </div>
+</div>
 {% endblock %}

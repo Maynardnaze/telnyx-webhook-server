@@ -1,18 +1,27 @@
 {% extends "admin_base.html" %}
-{% block title %}Webhook Simulator · Telnyx Webhook Admin{% endblock %}
+{% block title %}Tools · Webhook Simulator · Miswitch Insights Console{% endblock %}
+{% block page_title %}Tools{% endblock %}
+{% block page_subtitle %}Webhook Simulator{% endblock %}
 {% block content %}
-<h1>Webhook Simulator</h1>
+<nav class="tools-tabs">
+  <a class="tools-tab" href="/admin/tools/assistant-init">Assistant Init</a>
+  <span class="tools-tab disabled">Async Jobs</span>
+  <a class="tools-tab active" href="/admin/tools/webhook-simulator">Webhook Simulator</a>
+</nav>
+
+<p class="page-copy">Store a sample insight payload through the same SQLite persistence path used by the Telnyx webhook receiver.</p>
+
 <section class="panel">
-  <p>Store a sample insight payload through the same SQLite persistence path used by the Telnyx webhook receiver. No external APIs are called.</p>
   {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
   <form method="post" action="/admin/tools/webhook-simulator" class="stacked">
     <label>Payload JSON<textarea name="payload" rows="16">{{ payload }}</textarea></label>
     <button type="submit">Store simulated insight</button>
   </form>
 </section>
+
 {% if result %}
 <section class="panel">
-  <h2>Result</h2>
+  <div class="panel-head"><h2 class="panel-title">Result</h2></div>
   <pre><code>{{ result }}</code></pre>
 </section>
 {% endif %}
