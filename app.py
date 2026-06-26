@@ -70,8 +70,12 @@ WAIVER_SMS_TEMPLATES = {
     },
 }
 
-ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", str(APP_DIR / "data" / "assistant-names.json")))
+ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", "/data/assistant-names.json"))
 ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
+ASSISTANT_NAMES_REFRESH_SECONDS = int(os.environ.get("ASSISTANT_NAMES_REFRESH_SECONDS", "900"))
+TELNYX_ASSISTANTS_URL = os.environ.get("TELNYX_ASSISTANTS_URL", "https://api.telnyx.com/v2/ai/assistants?page[size]=100")
+_assistant_names_cache: dict[str, str] = {}
+_assistant_names_cache_at = 0.0
 
 MYSWITCH_INSIGHT_GROUP_ID = "e58ece8c-f50b-47ed-86d9-8ec6483439c1"
 MYSWITCH_INSIGHT_DEFINITIONS: list[dict[str, Any]] = [
@@ -347,7 +351,7 @@ def load_assistant_memory_profiles() -> dict[str, dict[str, Any]]:
     return {str(key): value for key, value in parsed.items() if isinstance(value, dict)}
 
 
-def load_assistant_name_map() -> dict[str, str]:
+def load_local_assistant_name_map() -> dict[str, str]:
     names: dict[str, str] = {}
     if ASSISTANT_NAMES_PATH.exists():
         try:
@@ -371,6 +375,44 @@ def load_assistant_name_map() -> dict[str, str]:
         label = first_present(profile.get("name"), profile.get("alias"), profile.get("display_name"))
         if label:
             names[assistant_id] = str(label)
+    return names
+
+
+def load_telnyx_assistant_name_map(force: bool = False) -> dict[str, str]:
+    """Best-effort assistant name lookup from Telnyx, cached briefly for admin UI pages."""
+    global _assistant_names_cache, _assistant_names_cache_at
+    now = time.time()
+    if not force and _assistant_names_cache and now - _assistant_names_cache_at < ASSISTANT_NAMES_REFRESH_SECONDS:
+        return dict(_assistant_names_cache)
+    api_key = env_or_file("TELNYX_API_KEY")
+    if not api_key:
+        return dict(_assistant_names_cache)
+    request = urlrequest.Request(TELNYX_ASSISTANTS_URL, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
+    try:
+        with urlrequest.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return dict(_assistant_names_cache)
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    names: dict[str, str] = {}
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            assistant_id = first_present(item.get("id"), item.get("assistant_id"))
+            label = first_present(item.get("name"), item.get("assistant_name"), item.get("title"))
+            if assistant_id and label:
+                names[str(assistant_id)] = str(label).strip()
+    if names:
+        _assistant_names_cache = names
+        _assistant_names_cache_at = now
+    return dict(_assistant_names_cache)
+
+
+def load_assistant_name_map() -> dict[str, str]:
+    names = load_telnyx_assistant_name_map()
+    # Local/env names intentionally override Telnyx names for display aliases.
+    names.update(load_local_assistant_name_map())
     return names
 
 

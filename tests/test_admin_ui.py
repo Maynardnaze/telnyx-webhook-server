@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -133,6 +134,8 @@ def test_assistant_name_map_and_rollup_page(tmp_path):
         encoding="utf-8",
     )
     webhook_app.ASSISTANT_NAMES_PATH = names_file
+    webhook_app._assistant_names_cache = {}
+    webhook_app._assistant_names_cache_at = 0.0
     client = TestClient(webhook_app.app)
     login(client)
     seed_insight(client)
@@ -142,6 +145,29 @@ def test_assistant_name_map_and_rollup_page(tmp_path):
     assert "Admin Test Assistant" in page.text
     assert "assistant-admin-test" in page.text
     assert webhook_app.assistant_name_for("assistant-admin-test") == "Admin Test Assistant"
+
+
+def test_assistant_name_map_fetches_telnyx_names(tmp_path, monkeypatch):
+    configure_tmp_db(tmp_path)
+    webhook_app.ASSISTANT_NAMES_PATH = tmp_path / "missing-assistant-names.json"
+    webhook_app.ASSISTANT_NAMES_JSON = ""
+    webhook_app._assistant_names_cache = {}
+    webhook_app._assistant_names_cache_at = 0.0
+    monkeypatch.setattr(webhook_app, "env_or_file", lambda name, default=None: "test-key" if name == "TELNYX_API_KEY" else default)
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"data": [{"id": "assistant-live", "name": "Live Assistant"}]}).encode("utf-8")
+
+    monkeypatch.setattr(webhook_app.urlrequest, "urlopen", lambda request, timeout=8: FakeResponse())
+
+    assert webhook_app.assistant_name_for("assistant-live") == "Live Assistant"
 
 
 def test_admin_webhook_simulator_stores_insight(tmp_path):
