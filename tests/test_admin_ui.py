@@ -53,7 +53,8 @@ def test_admin_login_page_and_cookie(tmp_path):
 
     page = client.get("/admin/login")
     assert page.status_code == 200
-    assert "Telnyx Webhook Admin" in page.text
+    assert "Miswitch" in page.text
+    assert "insights console" in page.text
 
     bad = client.post("/admin/login", data={"secret": "wrong"})
     assert bad.status_code == 401
@@ -77,7 +78,8 @@ def test_admin_dashboard_requires_login_and_shows_stats(tmp_path):
     dashboard = client.get("/admin")
     assert dashboard.status_code == 200
     assert "Dashboard" in dashboard.text
-    assert "Insight records" in dashboard.text
+    assert "Stored records" in dashboard.text
+    assert "Recent insights" in dashboard.text
     assert "1" in dashboard.text
 
     stats = client.get("/admin/api/stats")
@@ -93,12 +95,13 @@ def test_admin_insight_list_and_detail(tmp_path):
 
     list_page = client.get("/admin/insights")
     assert list_page.status_code == 200
-    assert "conversation_insight_result" in list_page.text
     assert insight_id in list_page.text
+    assert "assistant-admin-test" in list_page.text
+    assert "Caller asked for service status" in list_page.text
 
     detail = client.get(f"/admin/insights/{insight_id}")
     assert detail.status_code == 200
-    assert "Pretty JSON" in detail.text
+    assert "Raw JSON" in detail.text
     assert "assistant-admin-test" in detail.text
 
     api_detail = client.get(f"/admin/api/insights/{insight_id}")
@@ -120,6 +123,25 @@ def test_admin_assistant_init_tester(tmp_path):
     assert response.status_code == 200
     assert "conversation_query" in response.text
     assert "assistant-ui" in response.text
+
+
+def test_assistant_name_map_and_rollup_page(tmp_path):
+    configure_tmp_db(tmp_path)
+    names_file = tmp_path / "assistant-names.json"
+    names_file.write_text(
+        '{"assistant-admin-test": "Admin Test Assistant"}',
+        encoding="utf-8",
+    )
+    webhook_app.ASSISTANT_NAMES_PATH = names_file
+    client = TestClient(webhook_app.app)
+    login(client)
+    seed_insight(client)
+
+    page = client.get("/admin/assistants")
+    assert page.status_code == 200
+    assert "Admin Test Assistant" in page.text
+    assert "assistant-admin-test" in page.text
+    assert webhook_app.assistant_name_for("assistant-admin-test") == "Admin Test Assistant"
 
 
 def test_admin_webhook_simulator_stores_insight(tmp_path):

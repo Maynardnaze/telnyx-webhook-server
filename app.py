@@ -70,6 +70,18 @@ WAIVER_SMS_TEMPLATES = {
     },
 }
 
+ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", str(APP_DIR / "data" / "assistant-names.json")))
+ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
+
+MYSWITCH_INSIGHT_GROUP_ID = "e58ece8c-f50b-47ed-86d9-8ec6483439c1"
+MYSWITCH_INSIGHT_DEFINITIONS: list[dict[str, Any]] = [
+    {"id": "78ae8f13-50fb-4bb0-afea-be087458d493", "key": "caller_identity", "name": "Caller Identity", "order": 1},
+    {"id": "73145dab-78a8-4ef8-bc8d-3ec132089f8b", "key": "sentiment_v2", "name": "Sentiment Confidence V2", "order": 2},
+    {"id": "b5182c7c-1ec3-46ed-bb6e-e43c33d2fbb0", "key": "call_category", "name": "Customer Intent / Call Category", "order": 3},
+    {"id": "e0398bdc-55c1-4a32-a430-1bd3b625afb2", "key": "resolution_status", "name": "Call Resolution Status", "order": 4},
+    {"id": "cfcc865c-d3d4-4823-8a4b-f0df57d9f56f", "key": "summary", "name": "Summary", "order": 5},
+]
+
 app = FastAPI(
     title="Miswitch Telnyx Webhook Server",
     version="0.2.0",
@@ -77,6 +89,19 @@ app = FastAPI(
 )
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 app.mount("/admin/static", StaticFiles(directory=str(APP_DIR / "static"), check_dir=False), name="admin_static")
+
+
+def render_admin(request: Request, template_name: str, context: dict[str, Any], status_code: int = 200) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        template_name,
+        {
+            **context,
+            "console_stats": get_insight_stats() if template_name != "admin_login.html" else None,
+            "myswitch_group_short": f"{MYSWITCH_INSIGHT_GROUP_ID[:8]}…{MYSWITCH_INSIGHT_GROUP_ID[-6:]}",
+        },
+        status_code=status_code,
+    )
 
 _db_lock = threading.Lock()
 
@@ -320,6 +345,48 @@ def load_assistant_memory_profiles() -> dict[str, dict[str, Any]]:
     if not isinstance(parsed, dict):
         return {}
     return {str(key): value for key, value in parsed.items() if isinstance(value, dict)}
+
+
+def load_assistant_name_map() -> dict[str, str]:
+    names: dict[str, str] = {}
+    if ASSISTANT_NAMES_PATH.exists():
+        try:
+            parsed = json.loads(ASSISTANT_NAMES_PATH.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if value:
+                        names[str(key)] = str(value).strip()
+        except (OSError, json.JSONDecodeError):
+            pass
+    if ASSISTANT_NAMES_JSON:
+        try:
+            parsed = json.loads(ASSISTANT_NAMES_JSON)
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if value:
+                        names[str(key)] = str(value).strip()
+        except json.JSONDecodeError:
+            pass
+    for assistant_id, profile in load_assistant_memory_profiles().items():
+        label = first_present(profile.get("name"), profile.get("alias"), profile.get("display_name"))
+        if label:
+            names[assistant_id] = str(label)
+    return names
+
+
+def fallback_assistant_name(assistant_id: str | None) -> str:
+    if not assistant_id or assistant_id == "unknown":
+        return "Unknown assistant"
+    if assistant_id.startswith("assistant-"):
+        return "Unnamed assistant"
+    return re.sub(r"\s+", " ", assistant_id.replace("_", " ").replace("-", " ")).strip().title()
+
+
+def assistant_name_for(assistant_id: str | None, name_map: dict[str, str] | None = None) -> str:
+    if not assistant_id:
+        return "Unknown assistant"
+    mapping = name_map if name_map is not None else load_assistant_name_map()
+    return mapping.get(assistant_id) or fallback_assistant_name(assistant_id)
 
 
 def normalize_phone(value: Any) -> str | None:
@@ -684,22 +751,278 @@ def get_insight_by_id(insight_id: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
+def json_pretty(value: Any) -> str:
+    return json.dumps(value, indent=2, sort_keys=True, default=str)
+
+
+def format_received_at(iso: str | None) -> str:
+    if not iso:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%b %d, %Y · %I:%M %p UTC")
+    except ValueError:
+        return iso
+
+
+def unwrap_insight_event(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    inner = data.get("payload") if isinstance(data.get("payload"), dict) else {}
-    event_type = data.get("event_type") or payload.get("event_type") or inner.get("event_type") or "unknown"
-    summary = first_present(inner.get("summary"), inner.get("intent"), payload.get("summary"), data.get("summary")) or "No summary found"
+    inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    if not inner:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        inner = data.get("payload") if isinstance(data.get("payload"), dict) else data
+    metadata = inner.get("metadata") if isinstance(inner.get("metadata"), dict) else {}
+    return payload, inner, metadata
+
+
+def parse_insight_result(raw: Any) -> Any:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text.startswith("```"):
+        chunks = text.split("```")
+        if len(chunks) >= 2:
+            text = chunks[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def parse_myswitch_results(inner: dict[str, Any]) -> list[dict[str, Any]]:
+    by_id = {
+        item.get("insight_id"): item
+        for item in (inner.get("results") or [])
+        if isinstance(item, dict) and item.get("insight_id")
+    }
+    parsed: list[dict[str, Any]] = []
+    for definition in MYSWITCH_INSIGHT_DEFINITIONS:
+        item = by_id.get(definition["id"], {})
+        raw = item.get("result")
+        value = parse_insight_result(raw)
+        if isinstance(value, dict):
+            result_format = "json"
+        elif isinstance(value, str) and ("**" in value or value.startswith("#")):
+            result_format = "markdown"
+        else:
+            result_format = "text"
+        parsed.append(
+            {
+                "key": definition["key"],
+                "name": definition["name"],
+                "insight_id": definition["id"],
+                "order": definition["order"],
+                "raw": raw,
+                "value": value,
+                "format": result_format,
+                "pretty": json_pretty(value) if isinstance(value, (dict, list)) else str(value or ""),
+            }
+        )
+    return parsed
+
+
+def caller_display_name(parsed_results: list[dict[str, Any]]) -> str | None:
+    for item in parsed_results:
+        if item["key"] != "caller_identity":
+            continue
+        value = item.get("value")
+        if isinstance(value, dict):
+            first = str(value.get("caller_first_name") or "").strip()
+            last = str(value.get("caller_last_name") or "").strip()
+            full = " ".join(part for part in (first, last) if part)
+            if full:
+                return full
+    return None
+
+
+def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
+    payload, inner, metadata = unwrap_insight_event(record)
+    parsed_results = parse_myswitch_results(inner)
+    by_key = {item["key"]: item for item in parsed_results}
+
+    sentiment = by_key.get("sentiment_v2", {}).get("value")
+    sentiment_label = None
+    sentiment_score = None
+    intent_name = None
+    if isinstance(sentiment, dict):
+        sentiment_label = first_present((sentiment.get("sentiment") or {}).get("label"))
+        sentiment_score = (sentiment.get("sentiment") or {}).get("score")
+        intent_name = first_present((sentiment.get("intent") or {}).get("name"))
+
+    category = by_key.get("call_category", {}).get("value")
+    primary_category = None
+    if isinstance(category, dict):
+        primary_category = first_present(category.get("primary_category"), category.get("Primary Reason for Call"))
+
+    resolution = by_key.get("resolution_status", {}).get("value")
+    resolution_status = None
+    if isinstance(resolution, dict):
+        resolution_status = first_present(resolution.get("resolution_status"), resolution.get("Status"))
+
+    summary_value = by_key.get("summary", {}).get("value")
+    summary_text = summary_value if isinstance(summary_value, str) else first_present(inner.get("summary")) or "No summary yet"
+    caller_name = caller_display_name(parsed_results)
+
+    channel = first_present(metadata.get("telnyx_conversation_channel"), inner.get("telnyx_conversation_channel")) or "unknown"
+    caller_phone = normalize_phone(metadata.get("telnyx_end_user_target") or metadata.get("from") or inner.get("from"))
+    agent_phone = normalize_phone(metadata.get("telnyx_agent_target") or metadata.get("to") or inner.get("to"))
+    assistant_id = first_present(metadata.get("assistant_id"), inner.get("assistant_id"))
+    assistant_names = load_assistant_name_map()
+    assistant_name = assistant_name_for(assistant_id, assistant_names)
+    resolution_key = "unresolved"
+    if resolution_status:
+        lowered = str(resolution_status).lower()
+        if "transfer" in lowered:
+            resolution_key = "transferred"
+        elif "partial" in lowered:
+            resolution_key = "partial"
+        elif "resolved" in lowered:
+            resolution_key = "resolved"
+
+    received_at = record.get("received_at")
+    received_at_short = "—"
+    if received_at:
+        try:
+            dt = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            received_at_short = dt.astimezone(timezone.utc).strftime("%H:%M:%SZ")
+        except ValueError:
+            received_at_short = received_at
+
     return {
         "id": record.get("id"),
-        "received_at": record.get("received_at"),
-        "event_type": event_type,
-        "assistant_id": first_present(inner.get("assistant_id"), data.get("assistant_id"), payload.get("assistant_id")),
-        "conversation_id": first_present(inner.get("conversation_id"), data.get("conversation_id"), payload.get("conversation_id")),
-        "caller": first_present(inner.get("from"), payload.get("from"), inner.get("caller"), payload.get("caller")),
+        "received_at": received_at,
+        "received_at_display": format_received_at(received_at),
+        "received_at_short": received_at_short,
+        "event_type": payload.get("event_type") or inner.get("event_type") or "unknown",
+        "assistant_id": assistant_id,
+        "assistant_name": assistant_name,
+        "assistant_short": (assistant_id[:18] + "…") if assistant_id and len(assistant_id) > 19 else assistant_id,
+        "conversation_id": first_present(inner.get("conversation_id"), payload.get("conversation_id")),
+        "insight_group_id": first_present(inner.get("insight_group_id")),
+        "is_myswitch": inner.get("insight_group_id") == MYSWITCH_INSIGHT_GROUP_ID,
+        "channel": channel,
+        "channel_label": "Phone call" if channel == "phone_call" else "SMS chat" if channel == "sms_chat" else channel.replace("_", " ").title(),
+        "caller_phone": caller_phone,
+        "agent_phone": agent_phone,
+        "caller_name": caller_name,
+        "caller": caller_name or caller_phone or "Unknown caller",
+        "sentiment_label": sentiment_label,
+        "sentiment_score": sentiment_score,
+        "intent_name": intent_name,
+        "primary_category": primary_category,
+        "resolution_status": resolution_status,
+        "resolution_key": resolution_key,
+        "channel_short": "phone" if channel == "phone_call" else "sms" if channel == "sms_chat" else channel,
+        "summary_text": str(summary_text),
+        "summary": str(summary_text)[:220],
         "signature_verified": bool(record.get("telnyx_signature_verified")),
         "shared_secret_verified": bool(record.get("shared_secret_verified")),
-        "summary": str(summary)[:220],
+        "called_tools": metadata.get("called_tools") if isinstance(metadata.get("called_tools"), list) else [],
+    }
+
+
+def build_insight_detail_context(record: dict[str, Any]) -> dict[str, Any]:
+    payload, inner, metadata = unwrap_insight_event(record)
+    parsed_results = parse_myswitch_results(inner)
+    fields = extract_insight_fields(record)
+    return {
+        "record": record,
+        "fields": fields,
+        "payload": payload,
+        "inner": inner,
+        "metadata": metadata,
+        "parsed_results": parsed_results,
+        "pretty_json": json_pretty(record),
+        "myswitch_group": MYSWITCH_INSIGHT_GROUP_ID,
+    }
+
+
+def get_insight_stats() -> dict[str, Any]:
+    insights = read_insights()
+    signature_verified = 0
+    shared_secret_verified = 0
+    phone_count = 0
+    sms_count = 0
+    sentiment_counts: dict[str, int] = {}
+    resolution_counts: dict[str, int] = {}
+    resolution_bars: list[dict[str, Any]] = []
+    latest_received_at = None
+    contained_count = 0
+    needs_review_count = 0
+    for record in insights:
+        if record.get("telnyx_signature_verified"):
+            signature_verified += 1
+        if record.get("shared_secret_verified"):
+            shared_secret_verified += 1
+        fields = extract_insight_fields(record)
+        if fields.get("channel") == "phone_call":
+            phone_count += 1
+        elif fields.get("channel") == "sms_chat":
+            sms_count += 1
+        label = fields.get("sentiment_label")
+        if label:
+            sentiment_counts[label] = sentiment_counts.get(label, 0) + 1
+        status = fields.get("resolution_status")
+        if status:
+            resolution_counts[status] = resolution_counts.get(status, 0) + 1
+        if fields.get("resolution_key") == "resolved":
+            contained_count += 1
+        if fields.get("resolution_key") in {"unresolved", "transferred"} or fields.get("sentiment_label") == "Negative":
+            needs_review_count += 1
+        latest_received_at = record.get("received_at") or latest_received_at
+    total = len(insights) or 1
+    bar_colors = {
+        "resolved": "#1ed886",
+        "transferred": "#f0b24e",
+        "partial": "#e3c84a",
+        "unresolved": "#ff6b5e",
+    }
+    for status, count in sorted(resolution_counts.items(), key=lambda item: item[1], reverse=True):
+        key = "resolved"
+        lowered = status.lower()
+        if "transfer" in lowered:
+            key = "transferred"
+        elif "partial" in lowered:
+            key = "partial"
+        elif "unresolved" in lowered:
+            key = "unresolved"
+        resolution_bars.append(
+            {
+                "label": status,
+                "count": count,
+                "pct": round(count * 100 / total, 1),
+                "color": bar_colors.get(key, "#8b94a2"),
+            }
+        )
+    sentiment_bars = []
+    for label, count in sorted(sentiment_counts.items(), key=lambda item: item[1], reverse=True):
+        color = "#1ed886" if label == "Positive" else "#ff6b5e" if label == "Negative" else "#8b94a2"
+        sentiment_bars.append({"label": label, "count": count, "pct": round(count * 100 / total, 1), "color": color})
+    return {
+        "ok": True,
+        "service": "miswitch-telnyx-webhook",
+        "db_path": str(DB_PATH),
+        "insight_count": len(insights),
+        "phone_count": phone_count,
+        "sms_count": sms_count,
+        "latest_received_at": latest_received_at,
+        "latest_received_at_display": format_received_at(latest_received_at),
+        "signature_verified_count": signature_verified,
+        "shared_secret_verified_count": shared_secret_verified,
+        "sentiment_counts": sentiment_counts,
+        "resolution_counts": resolution_counts,
+        "resolution_bars": resolution_bars,
+        "sentiment_bars": sentiment_bars,
+        "containment_pct": round(contained_count * 100 / total, 1),
+        "needs_review_count": needs_review_count,
+        "myswitch_group_id": MYSWITCH_INSIGHT_GROUP_ID,
     }
 
 
@@ -711,26 +1034,32 @@ def list_insight_summaries(limit: int = 50, q: str = "") -> list[dict[str, Any]]
     return summaries[-max(1, min(limit, 200)):][::-1]
 
 
-def get_insight_stats() -> dict[str, Any]:
-    insights = read_insights()
-    signature_verified = 0
-    shared_secret_verified = 0
-    latest_received_at = None
-    for record in insights:
-        if record.get("telnyx_signature_verified"):
-            signature_verified += 1
-        if record.get("shared_secret_verified"):
-            shared_secret_verified += 1
-        latest_received_at = record.get("received_at") or latest_received_at
-    return {
-        "ok": True,
-        "service": "miswitch-telnyx-webhook",
-        "db_path": str(DB_PATH),
-        "insight_count": len(insights),
-        "latest_received_at": latest_received_at,
-        "signature_verified_count": signature_verified,
-        "shared_secret_verified_count": shared_secret_verified,
-    }
+def list_assistant_rollups() -> list[dict[str, Any]]:
+    rollups: dict[str, dict[str, Any]] = {}
+    name_map = load_assistant_name_map()
+    for record in read_insights():
+        fields = extract_insight_fields(record)
+        assistant_id = fields.get("assistant_id") or "unknown"
+        entry = rollups.setdefault(
+            assistant_id,
+            {
+                "assistant_id": assistant_id,
+                "assistant_name": assistant_name_for(assistant_id, name_map),
+                "assistant_short": fields.get("assistant_short") or assistant_id,
+                "count": 0,
+                "phone_count": 0,
+                "sms_count": 0,
+                "resolved_count": 0,
+            },
+        )
+        entry["count"] += 1
+        if fields.get("channel") == "phone_call":
+            entry["phone_count"] += 1
+        elif fields.get("channel") == "sms_chat":
+            entry["sms_count"] += 1
+        if fields.get("resolution_key") == "resolved":
+            entry["resolved_count"] += 1
+    return sorted(rollups.values(), key=lambda item: item["count"], reverse=True)
 
 
 init_db()
@@ -777,7 +1106,7 @@ def admin_dashboard(request: Request):
         return redirect
     stats = get_insight_stats()
     recent = list_insight_summaries(limit=10)
-    return templates.TemplateResponse(request, "admin_dashboard.html", {"stats": stats, "recent": recent})
+    return render_admin(request, "admin_dashboard.html", {"stats": stats, "recent": recent, "active_page": "dashboard"})
 
 
 @app.get("/admin/api/stats")
@@ -794,7 +1123,16 @@ def admin_insights_page(request: Request, q: str = "", limit: int = Query(defaul
     if redirect:
         return redirect
     insights = list_insight_summaries(limit=limit, q=q)
-    return templates.TemplateResponse(request, "admin_insights.html", {"insights": insights, "q": q, "limit": limit})
+    return render_admin(request, "admin_insights.html", {"insights": insights, "q": q, "limit": limit, "active_page": "insights"})
+
+
+@app.get("/admin/assistants", response_class=HTMLResponse)
+def admin_assistants_page(request: Request):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    assistants = list_assistant_rollups()
+    return render_admin(request, "admin_assistants.html", {"assistants": assistants, "active_page": "assistants"})
 
 
 @app.get("/admin/api/insights")
@@ -814,12 +1152,7 @@ def admin_insight_detail_page(request: Request, insight_id: str):
     record = get_insight_by_id(insight_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Insight not found")
-    fields = extract_insight_fields(record)
-    return templates.TemplateResponse(
-        request,
-        "admin_insight_detail.html",
-        {"record": record, "fields": fields, "pretty_json": json_pretty(record)},
-    )
+    return render_admin(request, "admin_insight_detail.html", {**build_insight_detail_context(record), "active_page": "insights"})
 
 
 @app.get("/admin/api/insights/{insight_id}")
@@ -839,7 +1172,7 @@ def admin_async_jobs_page(request: Request, limit: int = Query(default=50, ge=1,
     if redirect:
         return redirect
     jobs = list_async_tool_jobs(limit=limit)
-    return templates.TemplateResponse(request, "admin_async_jobs.html", {"jobs": jobs})
+    return render_admin(request, "admin_async_jobs.html", {"jobs": jobs, "active_page": "async-jobs"})
 
 
 @app.get("/admin/api/async-jobs")
@@ -857,7 +1190,7 @@ def admin_assistant_init_page(request: Request):
     if redirect:
         return redirect
     sample = json_pretty({"data": {"payload": {"telnyx_end_user_target": "+12485550199", "telnyx_agent_target": "+12485550100", "telnyx_conversation_channel": "phone_call"}}})
-    return templates.TemplateResponse(request, "admin_assistant_init.html", {"payload": sample, "result": None, "error": None})
+    return render_admin(request, "admin_assistant_init.html", {"payload": sample, "result": None, "error": None, "active_page": "assistant-init"})
 
 
 @app.post("/admin/tools/assistant-init", response_class=HTMLResponse)
@@ -879,9 +1212,9 @@ async def admin_assistant_init_submit(request: Request):
             assistant_family_override=fields.get("assistant_family") or None,
             environment_override=fields.get("environment") or None,
         )
-        return templates.TemplateResponse(request, "admin_assistant_init.html", {"payload": payload_text, "result": json_pretty(result), "error": None})
+        return render_admin(request, "admin_assistant_init.html", {"payload": payload_text, "result": json_pretty(result), "error": None, "active_page": "assistant-init"})
     except Exception as exc:
-        return templates.TemplateResponse(request, "admin_assistant_init.html", {"payload": payload_text, "result": None, "error": str(exc)}, status_code=400)
+        return render_admin(request, "admin_assistant_init.html", {"payload": payload_text, "result": None, "error": str(exc), "active_page": "assistant-init"}, status_code=400)
 
 
 @app.get("/admin/tools/webhook-simulator", response_class=HTMLResponse)
@@ -890,7 +1223,7 @@ def admin_webhook_simulator_page(request: Request):
     if redirect:
         return redirect
     sample = json_pretty({"event_type": "conversation_insight_result", "payload": {"summary": "Sample insight from admin simulator"}})
-    return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": sample, "result": None, "error": None})
+    return render_admin(request, "admin_webhook_simulator.html", {"payload": sample, "result": None, "error": None, "active_page": "simulator"})
 
 
 @app.post("/admin/tools/webhook-simulator", response_class=HTMLResponse)
@@ -906,9 +1239,9 @@ async def admin_webhook_simulator_submit(request: Request):
             raise ValueError("Top-level JSON must be an object")
         record = store_insight(payload, {"admin_simulated": True, "shared_secret_verified": True}, path="/admin/tools/webhook-simulator")
         result = {"message": "Stored insight", "id": record["id"], "detail_url": f"/admin/insights/{record['id']}"}
-        return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": json_pretty(result), "error": None})
+        return render_admin(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": json_pretty(result), "error": None, "active_page": "simulator"})
     except Exception as exc:
-        return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": None, "error": str(exc)}, status_code=400)
+        return render_admin(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": None, "error": str(exc), "active_page": "simulator"}, status_code=400)
 
 
 @app.post("/telnyx/tools/send-waiver-sms")

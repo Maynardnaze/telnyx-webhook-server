@@ -1,7 +1,13 @@
 {% extends "admin_base.html" %}
-{% block title %}Async Tool Jobs · Telnyx Webhook Admin{% endblock %}
+{% block title %}Async Tool Jobs · Miswitch Insights Console{% endblock %}
+{% block page_title %}Async Tool Jobs{% endblock %}
+{% block page_subtitle %}Dry-run assistant tool callbacks{% endblock %}
 {% block content %}
-<h1>Async Tool Jobs</h1>
+<nav class="tools-tabs">
+  <a class="tools-tab" href="/admin/tools/assistant-init">Assistant Init</a>
+  <a class="tools-tab active" href="/admin/tools/async-jobs">Async Jobs</a>
+  <a class="tools-tab" href="/admin/tools/webhook-simulator">Webhook Simulator</a>
+</nav>
 <section class="panel">
   <p>Dry-run Telnyx AI Assistant async webhook tool jobs. These records prepare the Add Messages payload that would be sent back to the live conversation; no Telnyx API write is performed.</p>
   <p><code>POST /telnyx/tools/async/order-status</code> with <code>x-telnyx-call-control-id</code> and <code>x-webhook-secret</code>.</p>
