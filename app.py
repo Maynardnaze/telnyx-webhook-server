@@ -56,6 +56,13 @@ ASSISTANT_MEMORY_INSIGHT_QUERY = os.environ.get("ASSISTANT_MEMORY_INSIGHT_QUERY"
 ASSISTANT_MEMORY_PROFILES = os.environ.get("ASSISTANT_MEMORY_PROFILES", "").strip()
 TELNYX_API_KEY = env_or_file("TELNYX_API_KEY")
 TELNYX_MESSAGES_URL = os.environ.get("TELNYX_MESSAGES_URL", "https://api.telnyx.com/v2/messages")
+ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", "/data/assistant-names.json"))
+ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
+ASSISTANT_NAMES_REFRESH_SECONDS = int(os.environ.get("ASSISTANT_NAMES_REFRESH_SECONDS", "900"))
+TELNYX_ASSISTANTS_URL = os.environ.get("TELNYX_ASSISTANTS_URL", "https://api.telnyx.com/v2/ai/assistants?page[size]=100")
+TELNYX_ASSISTANT_URL_TEMPLATE = os.environ.get("TELNYX_ASSISTANT_URL_TEMPLATE", "https://api.telnyx.com/v2/ai/assistants/{assistant_id}")
+_assistant_names_cache: dict[str, str] = {}
+_assistant_names_cache_at = 0.0
 
 WAIVER_SMS_TEMPLATES = {
     "k1_speed": {
@@ -139,6 +146,105 @@ async def read_form_fields(request: Request) -> dict[str, str]:
 
 def json_pretty(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True, default=str)
+
+
+def _extract_telnyx_data(body: dict[str, Any]) -> Any:
+    data = body.get("data") if isinstance(body, dict) else None
+    return data if data is not None else body
+
+
+def _assistant_name_from_item(item: dict[str, Any]) -> tuple[str | None, str | None]:
+    assistant_id = first_present(item.get("id"), item.get("assistant_id"))
+    assistant_name = first_present(item.get("name"), item.get("display_name"), item.get("title"))
+    return (str(assistant_id) if assistant_id else None, str(assistant_name) if assistant_name else None)
+
+
+def load_local_assistant_name_map() -> dict[str, str]:
+    names: dict[str, str] = {}
+    if ASSISTANT_NAMES_PATH.exists():
+        try:
+            parsed = json.loads(ASSISTANT_NAMES_PATH.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                names.update({str(key): str(value) for key, value in parsed.items() if value})
+        except (OSError, json.JSONDecodeError):
+            pass
+    if ASSISTANT_NAMES_JSON:
+        try:
+            parsed = json.loads(ASSISTANT_NAMES_JSON)
+            if isinstance(parsed, dict):
+                names.update({str(key): str(value) for key, value in parsed.items() if value})
+        except json.JSONDecodeError:
+            pass
+    return names
+
+
+def fetch_telnyx_json(url: str) -> dict[str, Any] | None:
+    if not TELNYX_API_KEY:
+        return None
+    req = urlrequest.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {TELNYX_API_KEY}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=8) as response:
+            raw = response.read().decode("utf-8")
+            parsed = json.loads(raw) if raw else {}
+            return parsed if isinstance(parsed, dict) else None
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def load_telnyx_assistant_name_map() -> dict[str, str]:
+    body = fetch_telnyx_json(TELNYX_ASSISTANTS_URL)
+    data = _extract_telnyx_data(body or {})
+    items = data if isinstance(data, list) else []
+    names: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        assistant_id, assistant_name = _assistant_name_from_item(item)
+        if assistant_id and assistant_name:
+            names[assistant_id] = assistant_name
+    return names
+
+
+def load_assistant_name_map(force_refresh: bool = False) -> dict[str, str]:
+    global _assistant_names_cache, _assistant_names_cache_at
+    now = time.time()
+    if not force_refresh and _assistant_names_cache and now - _assistant_names_cache_at < ASSISTANT_NAMES_REFRESH_SECONDS:
+        return dict(_assistant_names_cache)
+    names = load_telnyx_assistant_name_map()
+    names.update(load_local_assistant_name_map())
+    _assistant_names_cache = names
+    _assistant_names_cache_at = now
+    return dict(names)
+
+
+def fetch_telnyx_assistant_name(assistant_id: str) -> str | None:
+    if not assistant_id or not TELNYX_API_KEY:
+        return None
+    url = TELNYX_ASSISTANT_URL_TEMPLATE.format(assistant_id=quote(assistant_id, safe=""))
+    body = fetch_telnyx_json(url)
+    data = _extract_telnyx_data(body or {})
+    if not isinstance(data, dict):
+        return None
+    returned_id, name = _assistant_name_from_item(data)
+    if name and (not returned_id or returned_id == assistant_id):
+        _assistant_names_cache[assistant_id] = name
+        return name
+    return None
+
+
+def assistant_display_name(assistant_id: Any) -> str:
+    assistant_id_str = str(assistant_id or "").strip()
+    if not assistant_id_str:
+        return ""
+    names = load_assistant_name_map()
+    return names.get(assistant_id_str) or fetch_telnyx_assistant_name(assistant_id_str) or assistant_id_str
 
 
 def _configured_public_key() -> str | None:
@@ -690,11 +796,13 @@ def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
     inner = data.get("payload") if isinstance(data.get("payload"), dict) else {}
     event_type = data.get("event_type") or payload.get("event_type") or inner.get("event_type") or "unknown"
     summary = first_present(inner.get("summary"), inner.get("intent"), payload.get("summary"), data.get("summary")) or "No summary found"
+    assistant_id = first_present(inner.get("assistant_id"), data.get("assistant_id"), payload.get("assistant_id"))
     return {
         "id": record.get("id"),
         "received_at": record.get("received_at"),
         "event_type": event_type,
-        "assistant_id": first_present(inner.get("assistant_id"), data.get("assistant_id"), payload.get("assistant_id")),
+        "assistant_id": assistant_id,
+        "assistant_display_name": assistant_display_name(assistant_id),
         "conversation_id": first_present(inner.get("conversation_id"), data.get("conversation_id"), payload.get("conversation_id")),
         "caller": first_present(inner.get("from"), payload.get("from"), inner.get("caller"), payload.get("caller")),
         "signature_verified": bool(record.get("telnyx_signature_verified")),

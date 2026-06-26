@@ -18,7 +18,7 @@
       <tr>
         <td>{{ item.received_at }}</td>
         <td>{{ item.event_type }}</td>
-        <td>{{ item.assistant_id or '' }}</td>
+        <td><strong>{{ item.assistant_display_name or item.assistant_id or '' }}</strong>{% if item.assistant_display_name and item.assistant_id and item.assistant_display_name != item.assistant_id %}<br><small>{{ item.assistant_id }}</small>{% endif %}</td>
         <td>{{ item.conversation_id or '' }}</td>
         <td>{{ item.caller or '' }}</td>
         <td>{% if item.signature_verified %}signature{% elif item.shared_secret_verified %}secret{% else %}unknown{% endif %}</td>

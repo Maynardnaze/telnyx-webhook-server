@@ -34,6 +34,10 @@ def configure_tmp_db(tmp_path: Path):
     webhook_app.ALLOW_NO_SECRET = False
     webhook_app.DB_PATH = tmp_path / "webhook.db"
     webhook_app._LEGACY_INSIGHTS_PATH = tmp_path / "insights.json"
+    webhook_app.ASSISTANT_NAMES_PATH = tmp_path / "assistant-names.json"
+    webhook_app.ASSISTANT_NAMES_JSON = ""
+    webhook_app._assistant_names_cache = {}
+    webhook_app._assistant_names_cache_at = 0.0
     webhook_app.init_db()
 
 
@@ -87,6 +91,7 @@ def test_admin_dashboard_requires_login_and_shows_stats(tmp_path):
 
 def test_admin_insight_list_and_detail(tmp_path):
     configure_tmp_db(tmp_path)
+    webhook_app.ASSISTANT_NAMES_PATH.write_text('{"assistant-admin-test":"Telnyx Portal Assistant"}', encoding="utf-8")
     client = TestClient(webhook_app.app)
     insight_id = seed_insight(client)
     login(client)
@@ -95,11 +100,17 @@ def test_admin_insight_list_and_detail(tmp_path):
     assert list_page.status_code == 200
     assert "conversation_insight_result" in list_page.text
     assert insight_id in list_page.text
+    assert "Telnyx Portal Assistant" in list_page.text
 
     detail = client.get(f"/admin/insights/{insight_id}")
     assert detail.status_code == 200
     assert "Pretty JSON" in detail.text
+    assert "Telnyx Portal Assistant" in detail.text
     assert "assistant-admin-test" in detail.text
+
+    api_list = client.get("/admin/api/insights")
+    assert api_list.status_code == 200
+    assert api_list.json()["insights"][0]["assistant_display_name"] == "Telnyx Portal Assistant"
 
     api_detail = client.get(f"/admin/api/insights/{insight_id}")
     assert api_detail.status_code == 200
