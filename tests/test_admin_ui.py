@@ -145,6 +145,7 @@ def test_assistant_name_map_and_rollup_page(tmp_path):
     assert "Admin Test Assistant" in page.text
     assert "assistant-admin-test" in page.text
     assert webhook_app.assistant_name_for("assistant-admin-test") == "Admin Test Assistant"
+    assert webhook_app.assistant_name_for("assistant-3c2dea60-17c9-4a08-87be-d3d84a2f734e") == "Legacy Events — SMS Concierge"
 
 
 def test_assistant_name_map_fetches_telnyx_names(tmp_path, monkeypatch):

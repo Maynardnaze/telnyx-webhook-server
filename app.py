@@ -72,6 +72,12 @@ WAIVER_SMS_TEMPLATES = {
 
 ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", "/data/assistant-names.json"))
 ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
+DEFAULT_ASSISTANT_NAMES = {
+    # Telnyx insight payloads include assistant_id but not always the portal label.
+    # Keep Andrew-facing display aliases here; /data/assistant-names.json and
+    # ASSISTANT_NAMES can still override these without code changes.
+    "assistant-3c2dea60-17c9-4a08-87be-d3d84a2f734e": "Legacy Events — SMS Concierge",
+}
 ASSISTANT_NAMES_REFRESH_SECONDS = int(os.environ.get("ASSISTANT_NAMES_REFRESH_SECONDS", "900"))
 TELNYX_ASSISTANTS_URL = os.environ.get("TELNYX_ASSISTANTS_URL", "https://api.telnyx.com/v2/ai/assistants?page[size]=100")
 _assistant_names_cache: dict[str, str] = {}
@@ -352,7 +358,7 @@ def load_assistant_memory_profiles() -> dict[str, dict[str, Any]]:
 
 
 def load_local_assistant_name_map() -> dict[str, str]:
-    names: dict[str, str] = {}
+    names: dict[str, str] = dict(DEFAULT_ASSISTANT_NAMES)
     if ASSISTANT_NAMES_PATH.exists():
         try:
             parsed = json.loads(ASSISTANT_NAMES_PATH.read_text(encoding="utf-8"))
