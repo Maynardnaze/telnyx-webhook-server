@@ -528,6 +528,9 @@ def format_received_at(iso: str | None) -> str:
 def unwrap_insight_event(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
     inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    if not inner:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        inner = data.get("payload") if isinstance(data.get("payload"), dict) else data
     metadata = inner.get("metadata") if isinstance(inner.get("metadata"), dict) else {}
     return payload, inner, metadata
 
