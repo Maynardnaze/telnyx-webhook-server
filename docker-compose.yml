@@ -11,12 +11,14 @@ services:
       WEBHOOK_DB_PATH: /data/webhook.db
       WEBHOOK_SECRET_FILE: /run/secrets/telnyx_webhook_secret
       TELNYX_PUBLIC_KEY: ${TELNYX_PUBLIC_KEY:-}
+      TELNYX_API_KEY_FILE: /run/secrets/telnyx_api_key
       ASSISTANT_MEMORY_FAMILY: ${ASSISTANT_MEMORY_FAMILY:-miswitch-ai-assistants}
       ASSISTANT_MEMORY_LIMIT: ${ASSISTANT_MEMORY_LIMIT:-5}
       ASSISTANT_MEMORY_INSIGHT_QUERY: ${ASSISTANT_MEMORY_INSIGHT_QUERY:-}
       ASSISTANT_MEMORY_PROFILES: ${ASSISTANT_MEMORY_PROFILES:-}
     secrets:
       - telnyx_webhook_secret
+      - telnyx_api_key
     volumes:
       - ./data:/data
     labels:
@@ -36,3 +38,5 @@ networks:
 secrets:
   telnyx_webhook_secret:
     file: ./secrets/telnyx_webhook_secret
+  telnyx_api_key:
+    file: ./secrets/telnyx_api_key

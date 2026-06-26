@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
@@ -52,6 +54,21 @@ DEFAULT_ASSISTANT_FAMILY = os.environ.get("ASSISTANT_MEMORY_FAMILY", "miswitch-a
 DEFAULT_MEMORY_LIMIT = int(os.environ.get("ASSISTANT_MEMORY_LIMIT", "5"))
 ASSISTANT_MEMORY_INSIGHT_QUERY = os.environ.get("ASSISTANT_MEMORY_INSIGHT_QUERY", "").strip()
 ASSISTANT_MEMORY_PROFILES = os.environ.get("ASSISTANT_MEMORY_PROFILES", "").strip()
+TELNYX_API_KEY = env_or_file("TELNYX_API_KEY")
+TELNYX_MESSAGES_URL = os.environ.get("TELNYX_MESSAGES_URL", "https://api.telnyx.com/v2/messages")
+
+WAIVER_SMS_TEMPLATES = {
+    "k1_speed": {
+        "display_name": "K1 Speed Oxford",
+        "url": "https://register.k1speed.com/oxf",
+        "text": "Here is the K1 Speed Oxford waiver / online check-in link for your visit to Legacy nine-two-five: https://register.k1speed.com/oxf",
+    },
+    "urban_air": {
+        "display_name": "Urban Air Oxford",
+        "url": "https://store.unleashedbrands.com/urban-air/oxford-mi/waiver",
+        "text": "Here is the Urban Air Oxford waiver link for your visit to Legacy nine-two-five: https://store.unleashedbrands.com/urban-air/oxford-mi/waiver",
+    },
+}
 
 app = FastAPI(
     title="Miswitch Telnyx Webhook Server",
@@ -165,6 +182,46 @@ def has_valid_shared_secret(x_webhook_secret: str | None, query_secret: str | No
         return True
     supplied = x_webhook_secret or query_secret
     return supplied == WEBHOOK_SECRET
+
+
+def _normalize_phone(value: Any) -> str:
+    phone = str(value or "").strip()
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    if phone.startswith("+") and 8 <= len(digits) <= 15:
+        return "+" + digits
+    raise HTTPException(status_code=400, detail="Invalid phone number")
+
+
+def send_telnyx_sms(*, from_number: str, to_number: str, text: str) -> dict[str, Any]:
+    if not TELNYX_API_KEY:
+        raise HTTPException(status_code=500, detail="TELNYX_API_KEY is not configured")
+    payload = json.dumps({"from": from_number, "to": to_number, "text": text}).encode("utf-8")
+    req = urlrequest.Request(
+        TELNYX_MESSAGES_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {TELNYX_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=10) as response:
+            body = response.read().decode("utf-8")
+            try:
+                data = json.loads(body or "{}")
+            except json.JSONDecodeError:
+                data = {"raw": body}
+            return {"status_code": response.status, "response": data}
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Telnyx Messages API error {exc.code}: {detail[:500]}") from exc
+    except URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Telnyx Messages API request failed: {exc.reason}") from exc
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -852,6 +909,41 @@ async def admin_webhook_simulator_submit(request: Request):
         return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": json_pretty(result), "error": None})
     except Exception as exc:
         return templates.TemplateResponse(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": None, "error": str(exc)}, status_code=400)
+
+
+@app.post("/telnyx/tools/send-waiver-sms")
+async def send_waiver_sms_tool(
+    request: Request,
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    check_secret(x_webhook_secret, request.query_params.get("secret"))
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+
+    business = str(payload.get("business") or "").strip()
+    template = WAIVER_SMS_TEMPLATES.get(business)
+    if not template:
+        raise HTTPException(status_code=400, detail="Unsupported waiver business")
+
+    from_number = _normalize_phone(payload.get("from"))
+    to_number = _normalize_phone(payload.get("to"))
+    result = send_telnyx_sms(from_number=from_number, to_number=to_number, text=template["text"])
+    message_id = None
+    response_data = result.get("response")
+    if isinstance(response_data, dict):
+        message_id = (response_data.get("data") or {}).get("id") if isinstance(response_data.get("data"), dict) else response_data.get("id")
+    return {
+        "ok": True,
+        "business": business,
+        "display_name": template["display_name"],
+        "sent_to": to_number,
+        "message_id": message_id,
+        "message": f"Sent {template['display_name']} waiver link by SMS.",
+    }
 
 
 @app.post("/telnyx/tools/async/{tool_name}")
