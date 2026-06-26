@@ -52,6 +52,8 @@ DEFAULT_ASSISTANT_FAMILY = os.environ.get("ASSISTANT_MEMORY_FAMILY", "miswitch-a
 DEFAULT_MEMORY_LIMIT = int(os.environ.get("ASSISTANT_MEMORY_LIMIT", "5"))
 ASSISTANT_MEMORY_INSIGHT_QUERY = os.environ.get("ASSISTANT_MEMORY_INSIGHT_QUERY", "").strip()
 ASSISTANT_MEMORY_PROFILES = os.environ.get("ASSISTANT_MEMORY_PROFILES", "").strip()
+ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", str(APP_DIR / "data" / "assistant-names.json")))
+ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
 
 MYSWITCH_INSIGHT_GROUP_ID = "e58ece8c-f50b-47ed-86d9-8ec6483439c1"
 MYSWITCH_INSIGHT_DEFINITIONS: list[dict[str, Any]] = [
@@ -270,6 +272,48 @@ def load_assistant_memory_profiles() -> dict[str, dict[str, Any]]:
     if not isinstance(parsed, dict):
         return {}
     return {str(key): value for key, value in parsed.items() if isinstance(value, dict)}
+
+
+def load_assistant_name_map() -> dict[str, str]:
+    names: dict[str, str] = {}
+    if ASSISTANT_NAMES_PATH.exists():
+        try:
+            parsed = json.loads(ASSISTANT_NAMES_PATH.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if value:
+                        names[str(key)] = str(value).strip()
+        except (OSError, json.JSONDecodeError):
+            pass
+    if ASSISTANT_NAMES_JSON:
+        try:
+            parsed = json.loads(ASSISTANT_NAMES_JSON)
+            if isinstance(parsed, dict):
+                for key, value in parsed.items():
+                    if value:
+                        names[str(key)] = str(value).strip()
+        except json.JSONDecodeError:
+            pass
+    for assistant_id, profile in load_assistant_memory_profiles().items():
+        label = first_present(profile.get("name"), profile.get("alias"), profile.get("display_name"))
+        if label:
+            names[assistant_id] = str(label)
+    return names
+
+
+def fallback_assistant_name(assistant_id: str | None) -> str:
+    if not assistant_id or assistant_id == "unknown":
+        return "Unknown assistant"
+    if assistant_id.startswith("assistant-"):
+        return "Unnamed assistant"
+    return re.sub(r"\s+", " ", assistant_id.replace("_", " ").replace("-", " ")).strip().title()
+
+
+def assistant_name_for(assistant_id: str | None, name_map: dict[str, str] | None = None) -> str:
+    if not assistant_id:
+        return "Unknown assistant"
+    mapping = name_map if name_map is not None else load_assistant_name_map()
+    return mapping.get(assistant_id) or fallback_assistant_name(assistant_id)
 
 
 def normalize_phone(value: Any) -> str | None:
@@ -583,6 +627,8 @@ def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
     caller_phone = normalize_phone(metadata.get("telnyx_end_user_target") or metadata.get("from") or inner.get("from"))
     agent_phone = normalize_phone(metadata.get("telnyx_agent_target") or metadata.get("to") or inner.get("to"))
     assistant_id = first_present(metadata.get("assistant_id"), inner.get("assistant_id"))
+    assistant_names = load_assistant_name_map()
+    assistant_name = assistant_name_for(assistant_id, assistant_names)
     resolution_key = "unresolved"
     if resolution_status:
         lowered = str(resolution_status).lower()
@@ -611,6 +657,7 @@ def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
         "received_at_short": received_at_short,
         "event_type": payload.get("event_type") or inner.get("event_type") or "unknown",
         "assistant_id": assistant_id,
+        "assistant_name": assistant_name,
         "assistant_short": (assistant_id[:18] + "…") if assistant_id and len(assistant_id) > 19 else assistant_id,
         "conversation_id": first_present(inner.get("conversation_id"), payload.get("conversation_id")),
         "insight_group_id": first_present(inner.get("insight_group_id")),
@@ -744,6 +791,7 @@ def list_insight_summaries(limit: int = 50, q: str = "") -> list[dict[str, Any]]
 
 def list_assistant_rollups() -> list[dict[str, Any]]:
     rollups: dict[str, dict[str, Any]] = {}
+    name_map = load_assistant_name_map()
     for record in read_insights():
         fields = extract_insight_fields(record)
         assistant_id = fields.get("assistant_id") or "unknown"
@@ -751,6 +799,7 @@ def list_assistant_rollups() -> list[dict[str, Any]]:
             assistant_id,
             {
                 "assistant_id": assistant_id,
+                "assistant_name": assistant_name_for(assistant_id, name_map),
                 "assistant_short": fields.get("assistant_short") or assistant_id,
                 "count": 0,
                 "phone_count": 0,

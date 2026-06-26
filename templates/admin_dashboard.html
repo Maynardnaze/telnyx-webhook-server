@@ -76,7 +76,7 @@
             <div class="col-time">{{ item.received_at_short }}</div>
             <div class="col-chan"><span class="pill {{ item.channel_short }}">{{ item.channel_short }}</span></div>
             <div class="col-assistant">
-              <div class="assistant-name">{{ item.assistant_short or 'Unknown assistant' }}</div>
+              <div class="assistant-name">{{ item.assistant_name }}</div>
               <div class="assistant-id">{{ item.assistant_id or '—' }}</div>
             </div>
             <div class="col-caller">{{ item.caller_phone or item.caller_name or '—' }}</div>

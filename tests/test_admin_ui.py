@@ -122,6 +122,25 @@ def test_admin_assistant_init_tester(tmp_path):
     assert "assistant-ui" in response.text
 
 
+def test_assistant_name_map_and_rollup_page(tmp_path):
+    configure_tmp_db(tmp_path)
+    names_file = tmp_path / "assistant-names.json"
+    names_file.write_text(
+        '{"assistant-admin-test": "Admin Test Assistant"}',
+        encoding="utf-8",
+    )
+    webhook_app.ASSISTANT_NAMES_PATH = names_file
+    client = TestClient(webhook_app.app)
+    login(client)
+    seed_insight(client)
+
+    page = client.get("/admin/assistants")
+    assert page.status_code == 200
+    assert "Admin Test Assistant" in page.text
+    assert "assistant-admin-test" in page.text
+    assert webhook_app.assistant_name_for("assistant-admin-test") == "Admin Test Assistant"
+
+
 def test_admin_webhook_simulator_stores_insight(tmp_path):
     configure_tmp_db(tmp_path)
     client = TestClient(webhook_app.app)

@@ -9,7 +9,7 @@
 <div class="assistant-grid">
   {% for item in assistants %}
   <a class="assistant-card" href="/admin/insights?q={{ item.assistant_id|urlencode }}">
-    <h3>{{ item.assistant_short }}</h3>
+    <h3>{{ item.assistant_name }}</h3>
     <div class="id-line">{{ item.assistant_id }}</div>
     <div class="assistant-stats">
       <div><span>deliveries</span><strong>{{ item.count }}</strong></div>

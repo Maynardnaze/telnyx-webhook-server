@@ -20,6 +20,7 @@
     <section class="panel">
       <div class="section-label">Conversation metadata</div>
       <div class="meta-rows">
+        <div class="meta-row"><span class="key">assistant_name</span><span class="val">{{ fields.assistant_name }}</span></div>
         <div class="meta-row"><span class="key">assistant_id</span><span class="val">{{ fields.assistant_id or '—' }}</span></div>
         <div class="meta-row"><span class="key">channel</span><span class="val">{{ fields.channel_label }}</span></div>
         <div class="meta-row"><span class="key">end_user → agent</span><span class="val">{{ fields.caller_phone or '—' }} → {{ fields.agent_phone or '—' }}</span></div>

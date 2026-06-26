@@ -51,7 +51,7 @@
     {% if insights %}
       {% for item in insights %}
       <a class="data-row" href="/admin/insights/{{ item.id }}" data-filter-item data-row-id="{{ item.id }}"
-         data-filter-text="{{ item.caller_name or '' }} {{ item.caller_phone or '' }} {{ item.summary or '' }} {{ item.intent_name or '' }} {{ item.primary_category or '' }} {{ item.conversation_id or '' }} {{ item.assistant_id or '' }}"
+         data-filter-text="{{ item.caller_name or '' }} {{ item.caller_phone or '' }} {{ item.summary or '' }} {{ item.intent_name or '' }} {{ item.primary_category or '' }} {{ item.conversation_id or '' }} {{ item.assistant_id or '' }} {{ item.assistant_name or '' }}"
          data-channel="{{ item.channel_short or '' }}"
          data-resolution="{{ item.resolution_key or '' }}"
          data-sentiment="{{ item.sentiment_label or '' }}"
@@ -62,7 +62,7 @@
         <div class="col-time">{{ item.received_at_short }}</div>
         <div class="col-chan"><span class="pill {{ item.channel_short }}">{{ item.channel_short }}</span></div>
         <div class="col-assistant">
-          <div class="assistant-name">{{ item.assistant_short or 'Unknown assistant' }}</div>
+          <div class="assistant-name">{{ item.assistant_name }}</div>
           <div class="assistant-id">{{ item.assistant_id or '—' }}</div>
         </div>
         <div class="col-caller">{{ item.caller_phone or item.caller_name or '—' }}</div>
