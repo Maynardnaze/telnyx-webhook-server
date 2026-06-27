@@ -126,7 +126,7 @@ def test_admin_assistant_init_tester(tmp_path):
     assert "assistant-ui" in response.text
 
 
-def test_assistant_name_map_and_rollup_page(tmp_path):
+def test_assistant_name_map_and_rollup_page(tmp_path, monkeypatch):
     configure_tmp_db(tmp_path)
     names_file = tmp_path / "assistant-names.json"
     names_file.write_text(
@@ -136,6 +136,7 @@ def test_assistant_name_map_and_rollup_page(tmp_path):
     webhook_app.ASSISTANT_NAMES_PATH = names_file
     webhook_app._assistant_names_cache = {}
     webhook_app._assistant_names_cache_at = 0.0
+    monkeypatch.setattr(webhook_app, "env_or_file", lambda name, default=None: default)
     client = TestClient(webhook_app.app)
     login(client)
     seed_insight(client)
@@ -145,12 +146,16 @@ def test_assistant_name_map_and_rollup_page(tmp_path):
     assert "Admin Test Assistant" in page.text
     assert "assistant-admin-test" in page.text
     assert webhook_app.assistant_name_for("assistant-admin-test") == "Admin Test Assistant"
-    assert webhook_app.assistant_name_for("assistant-3c2dea60-17c9-4a08-87be-d3d84a2f734e") == "Legacy Events — SMS Concierge"
 
 
-def test_assistant_name_map_fetches_telnyx_names(tmp_path, monkeypatch):
+def test_assistant_name_map_uses_telnyx_as_source_of_truth(tmp_path, monkeypatch):
     configure_tmp_db(tmp_path)
-    webhook_app.ASSISTANT_NAMES_PATH = tmp_path / "missing-assistant-names.json"
+    names_file = tmp_path / "assistant-names.json"
+    names_file.write_text(
+        '{"assistant-live": "Local Override Should Not Win"}',
+        encoding="utf-8",
+    )
+    webhook_app.ASSISTANT_NAMES_PATH = names_file
     webhook_app.ASSISTANT_NAMES_JSON = ""
     webhook_app._assistant_names_cache = {}
     webhook_app._assistant_names_cache_at = 0.0
@@ -164,11 +169,36 @@ def test_assistant_name_map_fetches_telnyx_names(tmp_path, monkeypatch):
             return False
 
         def read(self):
-            return json.dumps({"data": [{"id": "assistant-live", "name": "Live Assistant"}]}).encode("utf-8")
+            return json.dumps({"data": [{"id": "assistant-live", "name": "Exact Telnyx Name"}]}).encode("utf-8")
 
     monkeypatch.setattr(webhook_app.urlrequest, "urlopen", lambda request, timeout=8: FakeResponse())
 
-    assert webhook_app.assistant_name_for("assistant-live") == "Live Assistant"
+    assert webhook_app.assistant_name_for("assistant-live") == "Exact Telnyx Name"
+
+
+def test_assistant_name_uses_payload_name_when_telnyx_lookup_unavailable(tmp_path, monkeypatch):
+    configure_tmp_db(tmp_path)
+    webhook_app.ASSISTANT_NAMES_PATH = tmp_path / "missing-assistant-names.json"
+    webhook_app.ASSISTANT_NAMES_JSON = ""
+    webhook_app._assistant_names_cache = {}
+    webhook_app._assistant_names_cache_at = 0.0
+    monkeypatch.setattr(webhook_app, "env_or_file", lambda name, default=None: default)
+    record = {
+        "id": "payload-name-record",
+        "received_at": "2026-06-23T12:05:00Z",
+        "payload": {
+            "data": {
+                "payload": {
+                    "assistant_id": "assistant-payload-name",
+                    "assistant_name": "Payload Telnyx Name",
+                }
+            }
+        },
+    }
+
+    fields = webhook_app.extract_insight_fields(record)
+
+    assert fields["assistant_name"] == "Payload Telnyx Name"
 
 
 def test_admin_webhook_simulator_stores_insight(tmp_path):

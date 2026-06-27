@@ -72,12 +72,6 @@ WAIVER_SMS_TEMPLATES = {
 
 ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", "/data/assistant-names.json"))
 ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
-DEFAULT_ASSISTANT_NAMES = {
-    # Telnyx insight payloads include assistant_id but not always the portal label.
-    # Keep Andrew-facing display aliases here; /data/assistant-names.json and
-    # ASSISTANT_NAMES can still override these without code changes.
-    "assistant-3c2dea60-17c9-4a08-87be-d3d84a2f734e": "Legacy Events — SMS Concierge",
-}
 ASSISTANT_NAMES_REFRESH_SECONDS = int(os.environ.get("ASSISTANT_NAMES_REFRESH_SECONDS", "900"))
 TELNYX_ASSISTANTS_URL = os.environ.get("TELNYX_ASSISTANTS_URL", "https://api.telnyx.com/v2/ai/assistants?page[size]=100")
 _assistant_names_cache: dict[str, str] = {}
@@ -358,7 +352,7 @@ def load_assistant_memory_profiles() -> dict[str, dict[str, Any]]:
 
 
 def load_local_assistant_name_map() -> dict[str, str]:
-    names: dict[str, str] = dict(DEFAULT_ASSISTANT_NAMES)
+    names: dict[str, str] = {}
     if ASSISTANT_NAMES_PATH.exists():
         try:
             parsed = json.loads(ASSISTANT_NAMES_PATH.read_text(encoding="utf-8"))
@@ -416,9 +410,10 @@ def load_telnyx_assistant_name_map(force: bool = False) -> dict[str, str]:
 
 
 def load_assistant_name_map() -> dict[str, str]:
-    names = load_telnyx_assistant_name_map()
-    # Local/env names intentionally override Telnyx names for display aliases.
-    names.update(load_local_assistant_name_map())
+    names = load_local_assistant_name_map()
+    # Telnyx is the source of truth for display names; local/env mappings are
+    # only fallbacks for offline/dev use or IDs the API cannot return.
+    names.update(load_telnyx_assistant_name_map())
     return names
 
 
@@ -435,6 +430,35 @@ def assistant_name_for(assistant_id: str | None, name_map: dict[str, str] | None
         return "Unknown assistant"
     mapping = name_map if name_map is not None else load_assistant_name_map()
     return mapping.get(assistant_id) or fallback_assistant_name(assistant_id)
+
+
+def nested_string(mapping: dict[str, Any], *path: str) -> str | None:
+    current: Any = mapping
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return first_present(current)
+
+
+def assistant_name_from_payload(payload: dict[str, Any], inner: dict[str, Any], metadata: dict[str, Any]) -> str | None:
+    """Prefer the assistant label delivered in the webhook payload before API/local fallback."""
+    return first_present(
+        metadata.get("assistant_name"),
+        metadata.get("assistant_display_name"),
+        nested_string(metadata, "assistant", "name"),
+        nested_string(metadata, "assistant", "assistant_name"),
+        inner.get("assistant_name"),
+        inner.get("assistant_display_name"),
+        nested_string(inner, "assistant", "name"),
+        nested_string(inner, "assistant", "assistant_name"),
+        payload.get("assistant_name"),
+        payload.get("assistant_display_name"),
+        nested_string(payload, "assistant", "name"),
+        nested_string(payload, "assistant", "assistant_name"),
+        nested_string(payload, "data", "assistant_name"),
+        nested_string(payload, "data", "assistant", "name"),
+    )
 
 
 def normalize_phone(value: Any) -> str | None:
@@ -921,7 +945,7 @@ def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
     agent_phone = normalize_phone(metadata.get("telnyx_agent_target") or metadata.get("to") or inner.get("to"))
     assistant_id = first_present(metadata.get("assistant_id"), inner.get("assistant_id"))
     assistant_names = load_assistant_name_map()
-    assistant_name = assistant_name_for(assistant_id, assistant_names)
+    assistant_name = (assistant_names.get(assistant_id) if assistant_id else None) or assistant_name_from_payload(payload, inner, metadata) or assistant_name_for(assistant_id, assistant_names)
     resolution_key = "unresolved"
     if resolution_status:
         lowered = str(resolution_status).lower()
