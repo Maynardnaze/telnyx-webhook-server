@@ -33,6 +33,8 @@ SAMPLE_INSIGHT = {
 def configure_tmp_db(tmp_path: Path):
     webhook_app.WEBHOOK_SECRET = SECRET
     webhook_app.ALLOW_NO_SECRET = False
+    webhook_app.ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS = False
+    webhook_app.ASSISTANT_NAMES_JSON = ""
     webhook_app.DB_PATH = tmp_path / "webhook.db"
     webhook_app._LEGACY_INSIGHTS_PATH = tmp_path / "insights.json"
     webhook_app.init_db()
@@ -143,8 +145,16 @@ def test_assistant_name_map_and_rollup_page(tmp_path, monkeypatch):
 
     page = client.get("/admin/assistants")
     assert page.status_code == 200
-    assert "Admin Test Assistant" in page.text
+    assert "Admin Test Assistant" not in page.text
+    assert "Unknown assistant" in page.text
     assert "assistant-admin-test" in page.text
+    assert webhook_app.assistant_name_for("assistant-admin-test") == "Unknown assistant"
+
+    webhook_app.ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS = True
+    webhook_app._assistant_names_cache = {}
+    page = client.get("/admin/assistants")
+    assert page.status_code == 200
+    assert "Admin Test Assistant" in page.text
     assert webhook_app.assistant_name_for("assistant-admin-test") == "Admin Test Assistant"
 
 
