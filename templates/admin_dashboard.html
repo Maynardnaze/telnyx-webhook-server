@@ -1,43 +1,132 @@
 {% extends "admin_base.html" %}
-{% block title %}Dashboard · Telnyx Webhook Admin{% endblock %}
+{% block title %}Dashboard · Miswitch Insights Console{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+{% block page_subtitle %}MySwitch insight group{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
-<section class="cards">
-  <div class="card"><span>Service</span><strong>{{ stats.service }}</strong></div>
-  <div class="card"><span>Insight records</span><strong>{{ stats.insight_count }}</strong></div>
-  <div class="card"><span>Latest received</span><strong>{{ stats.latest_received_at or 'none yet' }}</strong></div>
-  <div class="card"><span>Signature verified</span><strong>{{ stats.signature_verified_count }}</strong></div>
-  <div class="card"><span>Shared-secret fallback</span><strong>{{ stats.shared_secret_verified_count }}</strong></div>
-</section>
-<section class="panel">
-  <h2>Quick actions</h2>
-  <p>
-    <a class="button" href="/admin/insights">View Insights</a>
-    <a class="button" href="/admin/tools/assistant-init">Test Assistant Init</a>
-    <a class="button" href="/admin/tools/async-jobs">View Async Jobs</a>
-    <a class="button" href="/admin/tools/webhook-simulator">Simulate Webhook</a>
-    <a class="button secondary" href="/docs">FastAPI Docs</a>
-  </p>
-</section>
-<section class="panel">
-  <h2>Recent insights</h2>
-  {% if recent %}
-  <table>
-    <thead><tr><th>Received</th><th>Type</th><th>Assistant</th><th>Summary</th><th></th></tr></thead>
-    <tbody>
-      {% for item in recent %}
-      <tr>
-        <td>{{ item.received_at }}</td>
-        <td>{{ item.event_type }}</td>
-        <td>{{ item.assistant_id or '' }}</td>
-        <td>{{ item.summary }}</td>
-        <td><a href="/admin/insights/{{ item.id }}">Open</a></td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% else %}
-  <p>No insights stored yet.</p>
-  {% endif %}
-</section>
+
+<div class="kpi-grid">
+  <div class="kpi-card">
+    <div class="kpi-label">Stored records</div>
+    <div class="kpi-value">{{ stats.insight_count }}</div>
+    <div class="kpi-progress"><div style="width: {% if stats.insight_count > 100 %}100{% else %}{{ stats.insight_count }}{% endif %}%;"></div></div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">In view · all time</div>
+    <div class="kpi-value">{{ stats.insight_count }}</div>
+    <div class="kpi-foot positive">▲ live window</div>
+  </div>
+  <div class="kpi-card accent">
+    <div class="kpi-label">Signature ✓</div>
+    <div class="kpi-value">{{ stats.signature_verified_count }}</div>
+    <div class="kpi-foot">{{ stats.shared_secret_verified_count }} secret-fallback</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-label">Containment</div>
+    <div class="kpi-value">{{ stats.containment_pct }}%</div>
+    <div class="kpi-foot">resolved w/o transfer</div>
+  </div>
+  <a class="kpi-card danger" href="/admin/insights" style="text-decoration:none; color:inherit;">
+    <div class="kpi-label">⚑ Needs review</div>
+    <div class="kpi-value">{{ stats.needs_review_count }}</div>
+    <div class="kpi-foot">unresolved · flagged →</div>
+  </a>
+</div>
+
+<div class="dashboard-columns">
+  <div>
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">Resolution status</h2>
+        <span class="panel-meta">last {{ stats.insight_count }} conversations</span>
+      </div>
+      {% if stats.resolution_bars %}
+      <div class="bar-list">
+        {% for bar in stats.resolution_bars %}
+        <div>
+          <div class="bar-row-head">
+            <span class="bar-dot" style="background:{{ bar.color }};"></span>
+            <span style="color:var(--text-2);">{{ bar.label }}</span>
+            <span class="count">{{ bar.count }}</span>
+          </div>
+          <div class="bar-track"><div class="bar-fill" style="width:{{ bar.pct }}%; background:{{ bar.color }};"></div></div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">No resolution statuses parsed yet.</div>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">Recent insights</h2>
+        <a class="panel-link" href="/admin/insights">view conversations →</a>
+      </div>
+      {% if recent %}
+      <div class="data-table">
+        <div class="data-table-inner">
+          <div class="data-head">
+            <div class="col-time">Received</div>
+            <div class="col-chan">Chan</div>
+            <div class="col-assistant">Assistant</div>
+            <div class="col-caller">Caller</div>
+            <div class="col-summary">Summary</div>
+          </div>
+          {% for item in recent %}
+          <a class="data-row" href="/admin/insights/{{ item.id }}" style="text-decoration:none; color:inherit;">
+            <div class="col-time">{{ item.received_at_short }}</div>
+            <div class="col-chan"><span class="pill {{ item.channel_short }}">{{ item.channel_short }}</span></div>
+            <div class="col-assistant">
+              <div class="assistant-name">{{ item.assistant_name }}</div>
+              <div class="assistant-id">{{ item.assistant_id or '—' }}</div>
+            </div>
+            <div class="col-caller">{{ item.caller_phone or item.caller_name or '—' }}</div>
+            <div class="col-summary">{{ item.summary }}</div>
+          </a>
+          {% endfor %}
+        </div>
+      </div>
+      {% else %}
+      <div class="empty-state">No insight deliveries stored yet.</div>
+      {% endif %}
+    </section>
+  </div>
+
+  <div>
+    <section class="panel">
+      <div class="panel-head"><h2 class="panel-title">Channel mix</h2></div>
+      {% set total = stats.phone_count + stats.sms_count %}
+      {% if total %}
+      <div class="channel-stack">
+        <div class="phone" style="width:{{ (stats.phone_count * 100 / total)|round(1) }}%;"></div>
+        <div class="sms" style="width:{{ (stats.sms_count * 100 / total)|round(1) }}%;"></div>
+      </div>
+      <div class="channel-legend">
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--accent);"></span><span>phone</span><span class="count">{{ stats.phone_count }}</span></div>
+        <div class="legend-item"><span class="legend-swatch" style="background:var(--info);"></span><span>sms</span><span class="count">{{ stats.sms_count }}</span></div>
+      </div>
+      {% else %}
+      <div class="empty-state">No channel data yet.</div>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2 class="panel-title">Sentiment</h2></div>
+      {% if stats.sentiment_bars %}
+      <div class="bar-list">
+        {% for bar in stats.sentiment_bars %}
+        <div style="display:flex; align-items:center; gap:10px;">
+          <span style="width:58px; font-size:12px; color:var(--muted-5);">{{ bar.label }}</span>
+          <div class="bar-track" style="flex:1;"><div class="bar-fill" style="width:{{ bar.pct }}%; background:{{ bar.color }};"></div></div>
+          <span class="mono" style="font-size:11.5px; color:var(--muted-5); width:22px; text-align:right;">{{ bar.count }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">No sentiment labels parsed yet.</div>
+      {% endif %}
+    </section>
+  </div>
+</div>
+
 {% endblock %}
