@@ -917,6 +917,9 @@ pre.compact { max-height: 230px; white-space: pre; }
   color: var(--danger-soft);
 }
 
+.error-text { color: var(--danger-soft); }
+.compact-panel { display: flex; justify-content: space-between; gap: 1rem; align-items: center; }
+
 .login-page {
   min-height: 100vh;
   display: grid;

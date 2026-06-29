@@ -3,7 +3,11 @@
 {% block page_title %}Assistants{% endblock %}
 {% block page_subtitle %}Grouped by assistant_id{% endblock %}
 {% block content %}
-<p class="page-copy">Derived rollup grouped by <code>assistant_id</code> — click to filter Insights.</p>
+<p class="page-copy">Derived rollup grouped by <code>assistant_id</code> — click to filter Insights. This page calls <code>/admin/api/assistant-names?refresh=true</code> in the browser and replaces fallback names with the live Telnyx portal names.</p>
+<div class="panel compact-panel" data-assistant-name-loader data-endpoint="/admin/api/assistant-names?refresh=true">
+  <div><strong>Telnyx assistant-name API</strong>: <span data-assistant-name-status>Loading live names…</span></div>
+  <button type="button" class="secondary" data-assistant-name-refresh>Refresh names</button>
+</div>
 {% if assistant_name_status and not assistant_name_status.ok %}
 <div class="alert error">
   Telnyx assistant-name lookup failed: <code>{{ assistant_name_status.reason }}</code>
@@ -17,8 +21,8 @@
 {% if assistants %}
 <div class="assistant-grid">
   {% for item in assistants %}
-  <a class="assistant-card" href="/admin/insights?q={{ item.assistant_id|urlencode }}">
-    <h3>{{ item.assistant_name }}</h3>
+  <a class="assistant-card" href="/admin/insights?q={{ item.assistant_id|urlencode }}" data-assistant-card data-assistant-id="{{ item.assistant_id }}">
+    <h3 data-assistant-name>{{ item.assistant_name }}</h3>
     <div class="id-line">{{ item.assistant_id }}</div>
     <div class="assistant-stats">
       <div><span>deliveries</span><strong>{{ item.count }}</strong></div>
