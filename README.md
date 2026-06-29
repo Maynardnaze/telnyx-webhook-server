@@ -94,7 +94,7 @@ curl -s http://127.0.0.1:8787/telnyx/insights -H 'x-webhook-secret: your-secret'
 
 Interactive API docs are available at `http://127.0.0.1:8787/docs` while the server is running.
 
-The private admin UI is available at `http://127.0.0.1:8787/admin`. Sign in with the same shared secret used for `x-webhook-secret`. In local development with `WEBHOOK_ALLOW_NO_SECRET=1`, Telnyx endpoints skip auth, but the admin UI still expects the configured shared secret value.
+The **Miswitch Insights Console** is available at `http://127.0.0.1:8787/admin`. Sign in with the same shared secret used for `x-webhook-secret`. The UI parses MySwitch's five insight results (caller identity, sentiment, category, resolution, summary) into a dashboard and conversation detail view.
 
 ## Admin web UI
 
@@ -103,9 +103,9 @@ The first admin frontend is intentionally simple and served by FastAPI from the 
 | Route | Purpose |
 |-------|---------|
 | `/admin/login` | Browser login using the webhook shared secret |
-| `/admin` | Dashboard with health, SQLite path, record count, latest delivery, and auth stats |
-| `/admin/insights` | Browse/search recent stored Insight Group records |
-| `/admin/insights/{id}` | Inspect extracted fields and pretty JSON for one record |
+| `/admin` | Dashboard — delivery counts, sentiment/resolution breakdown, recent conversations |
+| `/admin/insights` | Conversation list with channel, sentiment, and intent badges |
+| `/admin/insights/{id}` | Detail view with all five MySwitch insight cards plus raw JSON |
 | `/admin/tools/assistant-init` | Test the local Dynamic Variables Webhook response builder |
 | `/admin/tools/async-jobs` | Review dry-run async tool jobs and prepared Add Messages payloads |
 | `/admin/tools/webhook-simulator` | Store a sample insight payload without calling external APIs |
