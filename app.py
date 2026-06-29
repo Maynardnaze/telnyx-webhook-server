@@ -77,6 +77,7 @@ ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS = os.environ.get("ALLOW_LOCAL_ASSISTANT_NAM
 TELNYX_ASSISTANTS_URL = os.environ.get("TELNYX_ASSISTANTS_URL", "https://api.telnyx.com/v2/ai/assistants?page[size]=100")
 _assistant_names_cache: dict[str, str] = {}
 _assistant_names_cache_at = 0.0
+_assistant_names_status: dict[str, Any] = {"ok": False, "reason": "not_loaded", "count": 0}
 
 MYSWITCH_INSIGHT_GROUP_ID = "e58ece8c-f50b-47ed-86d9-8ec6483439c1"
 MYSWITCH_INSIGHT_DEFINITIONS: list[dict[str, Any]] = [
@@ -381,18 +382,33 @@ def load_local_assistant_name_map() -> dict[str, str]:
 
 def load_telnyx_assistant_name_map(force: bool = False) -> dict[str, str]:
     """Best-effort assistant name lookup from Telnyx, cached briefly for admin UI pages."""
-    global _assistant_names_cache, _assistant_names_cache_at
+    global _assistant_names_cache, _assistant_names_cache_at, _assistant_names_status
     now = time.time()
     if not force and _assistant_names_cache and now - _assistant_names_cache_at < ASSISTANT_NAMES_REFRESH_SECONDS:
+        _assistant_names_status = {"ok": True, "reason": "cache", "count": len(_assistant_names_cache), "cached": True}
         return dict(_assistant_names_cache)
     api_key = env_or_file("TELNYX_API_KEY")
     if not api_key:
+        _assistant_names_status = {
+            "ok": False,
+            "reason": "missing_telnyx_api_key",
+            "count": len(_assistant_names_cache),
+            "telnyx_api_key_file": os.environ.get("TELNYX_API_KEY_FILE"),
+        }
         return dict(_assistant_names_cache)
     request = urlrequest.Request(TELNYX_ASSISTANTS_URL, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
     try:
         with urlrequest.urlopen(request, timeout=8) as response:
+            status_code = getattr(response, "status", None) or getattr(response, "getcode", lambda: None)()
             payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+    except HTTPError as exc:
+        _assistant_names_status = {"ok": False, "reason": "telnyx_http_error", "status_code": exc.code, "count": len(_assistant_names_cache)}
+        return dict(_assistant_names_cache)
+    except (OSError, URLError, TimeoutError) as exc:
+        _assistant_names_status = {"ok": False, "reason": "telnyx_request_error", "error": str(exc), "count": len(_assistant_names_cache)}
+        return dict(_assistant_names_cache)
+    except json.JSONDecodeError as exc:
+        _assistant_names_status = {"ok": False, "reason": "telnyx_json_error", "error": str(exc), "count": len(_assistant_names_cache)}
         return dict(_assistant_names_cache)
     items = payload.get("data") if isinstance(payload, dict) else payload
     names: dict[str, str] = {}
@@ -407,6 +423,9 @@ def load_telnyx_assistant_name_map(force: bool = False) -> dict[str, str]:
     if names:
         _assistant_names_cache = names
         _assistant_names_cache_at = now
+        _assistant_names_status = {"ok": True, "reason": "telnyx_api", "status_code": status_code, "count": len(names), "cached": False}
+    else:
+        _assistant_names_status = {"ok": False, "reason": "telnyx_returned_no_names", "status_code": status_code, "count": 0}
     return dict(_assistant_names_cache)
 
 
@@ -1209,7 +1228,20 @@ def admin_assistants_page(request: Request):
     if redirect:
         return redirect
     assistants = list_assistant_rollups()
-    return render_admin(request, "admin_assistants.html", {"assistants": assistants, "active_page": "assistants"})
+    return render_admin(
+        request,
+        "admin_assistants.html",
+        {"assistants": assistants, "assistant_name_status": _assistant_names_status, "active_page": "assistants"},
+    )
+
+
+@app.get("/admin/api/assistant-names")
+def admin_api_assistant_names(request: Request, refresh: bool = False):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    names = load_telnyx_assistant_name_map(force=refresh)
+    return {"status": _assistant_names_status, "count": len(names), "names": names}
 
 
 @app.get("/admin/api/insights")

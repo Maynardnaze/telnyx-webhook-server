@@ -194,7 +194,32 @@ def test_assistant_name_map_uses_telnyx_as_source_of_truth(tmp_path, monkeypatch
     page = client.get("/admin/assistants")
     assert page.status_code == 200
     assert "Exact Telnyx Name" in page.text
+    assert "Telnyx assistant-name lookup failed" not in page.text
     assert "Unnamed assistant" not in page.text
+
+    api = client.get("/admin/api/assistant-names?refresh=true")
+    assert api.status_code == 200
+    assert api.json()["status"]["ok"] is True
+    assert api.json()["names"]["assistant-live"] == "Exact Telnyx Name"
+
+
+def test_assistant_name_status_reports_missing_api_key(tmp_path, monkeypatch):
+    configure_tmp_db(tmp_path)
+    webhook_app._assistant_names_cache = {}
+    webhook_app._assistant_names_cache_at = 0.0
+    monkeypatch.setattr(webhook_app, "env_or_file", lambda name, default=None: default)
+    client = TestClient(webhook_app.app)
+    login(client)
+    seed_insight(client)
+
+    page = client.get("/admin/assistants")
+    assert page.status_code == 200
+    assert "Telnyx assistant-name lookup failed" in page.text
+    assert "missing_telnyx_api_key" in page.text
+
+    api = client.get("/admin/api/assistant-names?refresh=true")
+    assert api.status_code == 200
+    assert api.json()["status"]["reason"] == "missing_telnyx_api_key"
 
 
 def test_assistant_name_uses_payload_name_when_telnyx_lookup_unavailable(tmp_path, monkeypatch):
