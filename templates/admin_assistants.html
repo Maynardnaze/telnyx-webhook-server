@@ -4,6 +4,15 @@
 {% block page_subtitle %}Grouped by assistant_id{% endblock %}
 {% block content %}
 <p class="page-copy">Derived rollup grouped by <code>assistant_id</code> — click to filter Insights.</p>
+{% if assistant_name_status and not assistant_name_status.ok %}
+<div class="alert error">
+  Telnyx assistant-name lookup failed: <code>{{ assistant_name_status.reason }}</code>
+  {% if assistant_name_status.telnyx_api_key_file %}<br>Expected key file: <code>{{ assistant_name_status.telnyx_api_key_file }}</code>{% endif %}
+  {% if assistant_name_status.status_code %}<br>Telnyx HTTP status: <code>{{ assistant_name_status.status_code }}</code>{% endif %}
+  {% if assistant_name_status.error %}<br>Error: <code>{{ assistant_name_status.error }}</code>{% endif %}
+  <br><a href="/admin/api/assistant-names?refresh=true">Check assistant-name API status</a>
+</div>
+{% endif %}
 
 {% if assistants %}
 <div class="assistant-grid">
