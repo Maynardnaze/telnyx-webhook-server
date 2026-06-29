@@ -9,19 +9,15 @@ services:
     environment:
       TZ: ${TZ:-America/Detroit}
       WEBHOOK_DB_PATH: /data/webhook.db
-      WEBHOOK_SECRET_FILE: /run/secrets/telnyx_webhook_secret
-      TELNYX_PUBLIC_KEY: ${TELNYX_PUBLIC_KEY:-}
-      TELNYX_API_KEY_FILE: /run/secrets/telnyx_api_key
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?WEBHOOK_SECRET must be supplied by Doppler}
+      TELNYX_PUBLIC_KEY: ${TELNYX_PUBLIC_KEY:?TELNYX_PUBLIC_KEY must be supplied by Doppler}
+      TELNYX_API_KEY: ${TELNYX_API_KEY:-}
       ASSISTANT_MEMORY_FAMILY: ${ASSISTANT_MEMORY_FAMILY:-miswitch-ai-assistants}
       ASSISTANT_MEMORY_LIMIT: ${ASSISTANT_MEMORY_LIMIT:-5}
       ASSISTANT_MEMORY_INSIGHT_QUERY: ${ASSISTANT_MEMORY_INSIGHT_QUERY:-}
       ASSISTANT_MEMORY_PROFILES: ${ASSISTANT_MEMORY_PROFILES:-}
     volumes:
       - ./data:/data
-      # Mount the secrets directory instead of individual secret files so the
-      # container can start even if optional secrets (for example Telnyx API key
-      # used only by outbound SMS tools) have not been created yet.
-      - ./secrets:/run/secrets:ro
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=t3_proxy"

@@ -21,6 +21,8 @@ The server returns fast `200` acknowledgements so Telnyx does not retry deliveri
 
 **Insight payload reference:** [docs/telnyx-insights.md](docs/telnyx-insights.md) — webhook shape, stored record format, and the **MySwitch** Insight Group (`e58ece8c-…`) with `insight_id` mappings and examples.
 
+**Doppler migration guide:** [docs/doppler-migration.md](docs/doppler-migration.md) — step-by-step cutover plan for making Doppler the source of truth for runtime config and secrets.
+
 ## Repository layout
 
 ```text
@@ -31,33 +33,38 @@ telnyx-webhook-server/
 │   └── telnyx-insights.md # Insight Group webhook format and examples
 ├── templates/             # Server-rendered admin UI pages
 ├── static/                # Admin UI CSS/JS
-├── docker-compose.yml     # Production Compose stack
+├── docker-compose.yml     # Production Compose stack; expects Doppler-injected env vars
 ├── Dockerfile
-├── data/                  # Runtime data (gitignored except .gitkeep)
-│   └── webhook.db         # SQLite database (created on first run)
-└── secrets/
-    └── telnyx_webhook_secret   # Shared secret for inspection endpoints and curl tests
+└── data/                  # Runtime data (gitignored except .gitkeep)
+    └── webhook.db         # SQLite database (created on first run)
 ```
 
-## Quick start (Docker)
+## Quick start (Docker + Doppler)
 
 Prerequisites:
 
 - Docker and Docker Compose
+- Doppler CLI authenticated or a config-scoped `DOPPLER_TOKEN`
 - An external Docker network named `t3_proxy` (used by the Traefik stack in `~/docker`)
 
 ```bash
 git clone https://github.com/Maynardnaze/telnyx-webhook-server.git
 cd telnyx-webhook-server
-cp .env.example .env
-mkdir -p data secrets
+mkdir -p data
 
-# Put only the secret value in the file — no "WEBHOOK_SECRET=" prefix
-nano secrets/telnyx_webhook_secret
-chmod 600 secrets/telnyx_webhook_secret
-
-docker compose up -d --build
+doppler setup --project telnyx-webhook-server --config dev
+doppler run -- docker compose up -d --build
 curl -skS https://webhook.miswitch.cloud/health
+```
+
+Production deploys should use the `prd` Doppler config:
+
+```bash
+cd ~/telnyx-webhook-server
+git pull --ff-only
+DOPPLER_TOKEN="$(sudo cat /etc/doppler/telnyx-webhook-server.token)" \
+  doppler run --project telnyx-webhook-server --config prd -- \
+  docker compose up -d --build
 ```
 
 ## Local development
@@ -70,11 +77,11 @@ source .venv/bin/activate
 pip install fastapi 'uvicorn[standard]' pynacl
 ```
 
-Run without auth (development only):
+Run with Doppler-managed config:
 
 ```bash
-WEBHOOK_ALLOW_NO_SECRET=1 WEBHOOK_DB_PATH=/tmp/telnyx-webhook.db \
-  uvicorn app:app --host 127.0.0.1 --port 8787 --reload
+# The dev config may set WEBHOOK_ALLOW_NO_SECRET=1 for isolated local testing.
+doppler run -- uvicorn app:app --host 127.0.0.1 --port 8787 --reload
 ```
 
 Smoke tests:
@@ -114,38 +121,37 @@ Admin sessions use a signed `admin_session` cookie derived from `WEBHOOK_SECRET`
 
 ## Configuration
 
-Copy `.env.example` to `.env` and adjust values as needed. Compose reads `.env` for variable substitution.
+Runtime configuration is managed in Doppler. Do not keep long-lived `.env` files or required `./secrets/*` files for this app. Docker Compose explicitly lists the variables it receives from `doppler run`.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `WEBHOOK_DB_PATH` | `/data/webhook.db` | SQLite database file for insight payloads |
-| `WEBHOOK_SECRET` | `change-me-local-test` | Shared secret for protected endpoints |
-| `WEBHOOK_SECRET_FILE` | — | Read secret from a file instead of `WEBHOOK_SECRET` (used in Compose) |
-| `TELNYX_PUBLIC_KEY` | — | Telnyx Ed25519 public key for `/telnyx/insights` signature verification |
-| `WEBHOOK_ALLOW_NO_SECRET` | `0` | Set to `1` to disable secret checks (local dev only) |
-| `WEBHOOK_INSIGHTS_PATH` | `/data/insights.json` | Legacy JSON path; used only for one-time migration into SQLite |
-| `TZ` | `America/Detroit` | Container timezone |
-| `DOMAINNAME_1` | `miswitch.cloud` | Hostname suffix for Traefik routing |
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `WEBHOOK_DB_PATH` | Compose constant | SQLite database file for insight payloads (`/data/webhook.db`) |
+| `WEBHOOK_SECRET` | Yes | Shared secret for admin login and protected endpoints |
+| `TELNYX_PUBLIC_KEY` | Production: yes | Telnyx Ed25519 public key for `/telnyx/insights` signature verification |
+| `TELNYX_API_KEY` | Feature-dependent | Telnyx REST API key for assistant names, Add Messages, and SMS helpers |
+| `WEBHOOK_ALLOW_NO_SECRET` | Local/CI only | Set to `1` only for isolated local dev or CI; never production |
+| `WEBHOOK_INSIGHTS_PATH` | No | Legacy JSON path; used only for one-time migration into SQLite |
+| `TZ` | Yes | Container timezone |
+| `DOMAINNAME_1` | Yes | Hostname suffix for Traefik routing |
+| `ASSISTANT_MEMORY_FAMILY` | No | Assistant memory namespace; default `miswitch-ai-assistants` |
+| `ASSISTANT_MEMORY_LIMIT` | No | Conversation memory query limit; default `5` |
+| `ASSISTANT_MEMORY_INSIGHT_QUERY` | No | Optional insight-memory query/filter string |
+| `ASSISTANT_MEMORY_PROFILES` | No | Optional per-assistant profile JSON |
 
 ### Shared secret
 
-Production uses a Docker secret file:
-
-```text
-secrets/telnyx_webhook_secret
-```
-
-Compose mounts it through `WEBHOOK_SECRET_FILE`. Put **only** the raw secret string in that file.
-
-Use the same value when inspecting stored payloads:
+`WEBHOOK_SECRET` comes from Doppler. Use the same value when inspecting stored payloads:
 
 ```text
 x-webhook-secret: <secret>
 ```
 
-### Telnyx public key
+### Telnyx public key and API key
 
-Set `TELNYX_PUBLIC_KEY` in `.env` to the Ed25519 verification key from the Telnyx Mission Control Portal (webhook/signing settings). This is a **public** key, not an API secret.
+Keep these separate in Doppler:
+
+- `TELNYX_PUBLIC_KEY`: Ed25519 webhook verification key from Telnyx Mission Control. This is a public verification key, not an API credential.
+- `TELNYX_API_KEY`: Telnyx REST API key used for assistant-name lookup and outbound Telnyx API helpers.
 
 When configured, Telnyx can POST to the clean URL without `?secret=`:
 
@@ -262,9 +268,9 @@ For field-by-field documentation, result format variations, and full payload exa
 
 In the Telnyx Mission Control Portal:
 
-1. Copy the Ed25519 public key into `TELNYX_PUBLIC_KEY` in `.env`.
+1. Store the Ed25519 public key in Doppler as `TELNYX_PUBLIC_KEY` for the target config.
 2. Set the Insight Group webhook URL to `https://webhook.<your-domain>/telnyx/insights`.
-3. Redeploy so the container picks up the new key.
+3. Redeploy with `doppler run` so the container picks up the new key.
 
 Verify delivery:
 
@@ -278,15 +284,19 @@ A successful delivery logs:
 POST /telnyx/insights HTTP/1.1" 200 OK
 ```
 
-Inspect stored records:
+Inspect stored records without printing the secret into shell history:
 
 ```bash
-curl -skS "https://webhook.miswitch.cloud/telnyx/insights?secret=$(cat secrets/telnyx_webhook_secret)"
+DOPPLER_TOKEN="$(sudo cat /etc/doppler/telnyx-webhook-server.token)" \
+  doppler run --project telnyx-webhook-server --config prd --command '
+    curl -skS "https://webhook.miswitch.cloud/telnyx/insights" \
+      -H "x-webhook-secret: $WEBHOOK_SECRET" | head -c 500
+  '
 ```
 
 ## Production deploy beside `~/docker`
 
-This repo runs as its own Compose project while Traefik stays in a separate `~/docker` stack. The webhook container joins the external `t3_proxy` network so Traefik can route to it by Docker labels.
+This repo runs as its own Compose project while Traefik stays in a separate `~/docker` stack. The webhook container joins the external `t3_proxy` network so Traefik can route to it by Docker labels. Doppler supplies environment-specific values at container create/recreate time.
 
 ### 1. Clone or update
 
@@ -294,8 +304,7 @@ This repo runs as its own Compose project while Traefik stays in a separate `~/d
 cd ~
 git clone https://github.com/Maynardnaze/telnyx-webhook-server.git
 cd ~/telnyx-webhook-server
-cp .env.example .env
-mkdir -p data secrets
+mkdir -p data
 ```
 
 ### 2. Disable any old infra-managed copy
@@ -313,43 +322,45 @@ docker stop telnyx-webhook-server 2>/dev/null || true
 docker rm telnyx-webhook-server 2>/dev/null || true
 ```
 
-### 3. Configure `.env`
+### 3. Configure Doppler production access
+
+Create a read-only Doppler service token scoped to project `telnyx-webhook-server`, config `prd`, then store it outside the repo:
 
 ```bash
-nano ~/telnyx-webhook-server/.env
+sudo install -m 0700 -o root -g root -d /etc/doppler
+sudo sh -c 'printf %s "dp.st.xxxxx" > /etc/doppler/telnyx-webhook-server.token'
+sudo chmod 0600 /etc/doppler/telnyx-webhook-server.token
 ```
 
-Minimum recommended values:
+Required Doppler values for production include `TZ`, `DOMAINNAME_1`, `WEBHOOK_SECRET`, `TELNYX_PUBLIC_KEY`, and usually `TELNYX_API_KEY` for assistant-name lookup / Telnyx REST API helpers. See [docs/doppler-migration.md](docs/doppler-migration.md) for the full inventory and import commands.
 
-```env
-TZ=America/Detroit
-DOMAINNAME_1=miswitch.cloud
-TELNYX_PUBLIC_KEY=PASTE_TELNYX_PUBLIC_KEY_HERE
-```
-
-### 4. Configure the shared secret
-
-```bash
-nano ~/telnyx-webhook-server/secrets/telnyx_webhook_secret
-chmod 600 ~/telnyx-webhook-server/secrets/telnyx_webhook_secret
-```
-
-### 5. Deploy
+### 4. Deploy
 
 ```bash
 cd ~/telnyx-webhook-server
-docker compose up -d --build
+git pull --ff-only
+DOPPLER_TOKEN="$(sudo cat /etc/doppler/telnyx-webhook-server.token)" \
+  doppler run --project telnyx-webhook-server --config prd -- \
+  docker compose up -d --build
 ```
 
-### 6. Verify
+### 5. Verify
 
 ```bash
-docker exec telnyx-webhook-server printenv | grep -E 'TELNYX|WEBHOOK'
+docker exec telnyx-webhook-server sh -lc '
+  for name in TZ DOMAINNAME_1 WEBHOOK_DB_PATH WEBHOOK_SECRET TELNYX_PUBLIC_KEY TELNYX_API_KEY; do
+    if [ -n "$(printenv "$name")" ]; then
+      printf "%s=set\n" "$name"
+    else
+      printf "%s=MISSING\n" "$name"
+    fi
+  done
+'
 curl -skS https://webhook.miswitch.cloud/health
 ls -lh ~/telnyx-webhook-server/data/webhook.db
 ```
 
-`TELNYX_PUBLIC_KEY` should not be blank. `WEBHOOK_DB_PATH` should be `/data/webhook.db`.
+`WEBHOOK_SECRET`, `TELNYX_PUBLIC_KEY`, and `WEBHOOK_DB_PATH` should be set. `TELNYX_API_KEY` should be set when assistant-name lookup or outbound Telnyx API helpers are enabled.
 
 ## Traefik / Cloudflare Tunnel
 
@@ -385,7 +396,7 @@ middleware: chain-no-auth@file
 | Symptom | Likely cause | What to check |
 |---------|--------------|---------------|
 | `401` on `POST /telnyx/insights` | Missing signature and secret | Set `TELNYX_PUBLIC_KEY`, or use `?secret=` for testing |
-| `401` on `GET /telnyx/insights` | Wrong or missing secret | `secrets/telnyx_webhook_secret` and request header |
+| `401` on `GET /telnyx/insights` | Wrong or missing secret | `WEBHOOK_SECRET` in Doppler and request header |
 | Empty insight list | No deliveries yet | `docker logs telnyx-webhook-server` during a call |
 | Database permission errors | `data/` not writable | `mkdir -p data` and check volume mount permissions |
 
@@ -402,13 +413,14 @@ Required:
 Example:
 
 ```bash
-SECRET="$(cat secrets/telnyx_webhook_secret)"
-
-curl -s https://webhook.miswitch.cloud/telnyx/tools/async/order-status \
-  -H "content-type: application/json" \
-  -H "x-webhook-secret: $SECRET" \
-  -H "x-telnyx-call-control-id: demo-call-control-123" \
-  -d '{"order_id":"TEST-42","customer":{"phone":"+12485550199"}}'
+DOPPLER_TOKEN="$(sudo cat /etc/doppler/telnyx-webhook-server.token)" \
+  doppler run --project telnyx-webhook-server --config prd --command '
+    curl -s https://webhook.miswitch.cloud/telnyx/tools/async/order-status \
+      -H "content-type: application/json" \
+      -H "x-webhook-secret: $WEBHOOK_SECRET" \
+      -H "x-telnyx-call-control-id: demo-call-control-123" \
+      -d '\''{"order_id":"TEST-42","customer":{"phone":"+124****0199"}}'\''
+  '
 ```
 
 Example ACK:
