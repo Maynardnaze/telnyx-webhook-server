@@ -175,6 +175,17 @@ def test_assistant_name_map_uses_telnyx_as_source_of_truth(tmp_path, monkeypatch
 
     assert webhook_app.assistant_name_for("assistant-live") == "Exact Telnyx Name"
 
+    client = TestClient(webhook_app.app)
+    login(client)
+    insight = json.loads(json.dumps(SAMPLE_INSIGHT))
+    insight["data"]["payload"]["assistant_id"] = "assistant-live"
+    response = client.post("/telnyx/insights", json=insight, headers={"x-webhook-secret": SECRET})
+    assert response.status_code == 200
+    page = client.get("/admin/assistants")
+    assert page.status_code == 200
+    assert "Exact Telnyx Name" in page.text
+    assert "Unnamed assistant" not in page.text
+
 
 def test_assistant_name_uses_payload_name_when_telnyx_lookup_unavailable(tmp_path, monkeypatch):
     configure_tmp_db(tmp_path)

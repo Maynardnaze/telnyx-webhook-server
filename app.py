@@ -1116,7 +1116,7 @@ def list_assistant_rollups() -> list[dict[str, Any]]:
             assistant_id,
             {
                 "assistant_id": assistant_id,
-                "assistant_name": assistant_name_for(assistant_id, name_map),
+                "assistant_name": fields.get("assistant_name") or assistant_name_for(assistant_id, name_map),
                 "assistant_short": fields.get("assistant_short") or assistant_id,
                 "count": 0,
                 "phone_count": 0,
