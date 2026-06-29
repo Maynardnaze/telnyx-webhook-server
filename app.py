@@ -73,6 +73,7 @@ WAIVER_SMS_TEMPLATES = {
 ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", "/data/assistant-names.json"))
 ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
 ASSISTANT_NAMES_REFRESH_SECONDS = int(os.environ.get("ASSISTANT_NAMES_REFRESH_SECONDS", "900"))
+ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS = os.environ.get("ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS") == "1"
 TELNYX_ASSISTANTS_URL = os.environ.get("TELNYX_ASSISTANTS_URL", "https://api.telnyx.com/v2/ai/assistants?page[size]=100")
 _assistant_names_cache: dict[str, str] = {}
 _assistant_names_cache_at = 0.0
@@ -410,10 +411,14 @@ def load_telnyx_assistant_name_map(force: bool = False) -> dict[str, str]:
 
 
 def load_assistant_name_map() -> dict[str, str]:
-    names = load_local_assistant_name_map()
-    # Telnyx is the source of truth for display names; local/env mappings are
-    # only fallbacks for offline/dev use or IDs the API cannot return.
-    names.update(load_telnyx_assistant_name_map())
+    # Telnyx is the source of truth for display names. Local/env profile names
+    # are opt-in only because stale aliases can create made-up labels such as
+    # "Legacy Events — SMS Concierge" that do not match the Telnyx portal.
+    names = load_telnyx_assistant_name_map()
+    if ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS:
+        fallbacks = load_local_assistant_name_map()
+        fallbacks.update(names)
+        return fallbacks
     return names
 
 
@@ -421,7 +426,7 @@ def fallback_assistant_name(assistant_id: str | None) -> str:
     if not assistant_id or assistant_id == "unknown":
         return "Unknown assistant"
     if assistant_id.startswith("assistant-"):
-        return "Unnamed assistant"
+        return "Unknown assistant"
     return re.sub(r"\s+", " ", assistant_id.replace("_", " ").replace("-", " ")).strip().title()
 
 
