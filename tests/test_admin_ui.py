@@ -194,6 +194,9 @@ def test_assistant_name_map_uses_telnyx_as_source_of_truth(tmp_path, monkeypatch
     page = client.get("/admin/assistants")
     assert page.status_code == 200
     assert "Exact Telnyx Name" in page.text
+    assert "data-assistant-name-loader" in page.text
+    assert "data-assistant-card" in page.text
+    assert "/admin/api/assistant-names?refresh=true" in page.text
     assert "Telnyx assistant-name lookup failed" not in page.text
     assert "Unnamed assistant" not in page.text
 

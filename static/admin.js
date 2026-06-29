@@ -163,8 +163,56 @@ document.addEventListener('click', async (event) => {
   }
 });
 
+function initAssistantNameLoader() {
+  const loader = document.querySelector('[data-assistant-name-loader]');
+  if (!loader) return;
+
+  const endpoint = loader.dataset.endpoint || '/admin/api/assistant-names?refresh=true';
+  const status = loader.querySelector('[data-assistant-name-status]');
+  const refresh = loader.querySelector('[data-assistant-name-refresh]');
+  const cards = Array.from(document.querySelectorAll('[data-assistant-card][data-assistant-id]'));
+
+  const setStatus = (text, isError = false) => {
+    if (!status) return;
+    status.textContent = text;
+    status.classList.toggle('error-text', isError);
+  };
+
+  const load = async () => {
+    setStatus('Loading live Telnyx names…');
+    try {
+      const response = await fetch(endpoint, { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      const names = payload.names || {};
+      let updated = 0;
+      cards.forEach((card) => {
+        const assistantId = card.dataset.assistantId;
+        const liveName = names[assistantId];
+        const target = card.querySelector('[data-assistant-name]');
+        if (liveName && target && target.textContent !== liveName) {
+          target.textContent = liveName;
+          card.dataset.assistantNameSource = 'telnyx-api';
+          updated += 1;
+        }
+      });
+      if (payload.status?.ok) {
+        setStatus(`Loaded ${payload.count || Object.keys(names).length} names from Telnyx API · updated ${updated} visible card${updated === 1 ? '' : 's'}`);
+      } else {
+        setStatus(`Lookup failed: ${payload.status?.reason || 'unknown error'}`, true);
+      }
+    } catch (err) {
+      setStatus(`Lookup failed: ${err.message || err}`, true);
+    }
+  };
+
+  refresh?.addEventListener('click', load);
+  load();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   initReviewPanel();
   initClientFilter();
+  initAssistantNameLoader();
   decorateReviewPills();
 });
