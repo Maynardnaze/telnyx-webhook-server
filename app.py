@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -56,6 +56,20 @@ ASSISTANT_MEMORY_INSIGHT_QUERY = os.environ.get("ASSISTANT_MEMORY_INSIGHT_QUERY"
 ASSISTANT_MEMORY_PROFILES = os.environ.get("ASSISTANT_MEMORY_PROFILES", "").strip()
 TELNYX_API_KEY = env_or_file("TELNYX_API_KEY")
 TELNYX_MESSAGES_URL = os.environ.get("TELNYX_MESSAGES_URL", "https://api.telnyx.com/v2/messages")
+TRIPLESEAT_API_BASE_URL = os.environ.get("TRIPLESEAT_API_BASE_URL", "https://api.tripleseat.com").rstrip("/")
+TRIPLESEAT_PUBLIC_KEY = env_or_file("TRIPLESEAT_PUBLIC_KEY")
+TRIPLESEAT_ACCESS_TOKEN = env_or_file("TRIPLESEAT_ACCESS_TOKEN")
+TRIPLESEAT_LEAD_ENDPOINT = os.environ.get(
+    "TRIPLESEAT_LEAD_ENDPOINT",
+    f"{TRIPLESEAT_API_BASE_URL}/v1/leads/create.json",
+)
+TRIPLESEAT_BOOKING_ENDPOINT = os.environ.get(
+    "TRIPLESEAT_BOOKING_ENDPOINT",
+    f"{TRIPLESEAT_API_BASE_URL}/v1/bookings.json",
+)
+TRIPLESEAT_DEFAULT_LOCATION_ID = os.environ.get("TRIPLESEAT_DEFAULT_LOCATION_ID", "").strip()
+TRIPLESEAT_DEFAULT_LEAD_SOURCE = os.environ.get("TRIPLESEAT_DEFAULT_LEAD_SOURCE", "Telnyx Assistant").strip()
+TRIPLESEAT_DRY_RUN = os.environ.get("TRIPLESEAT_DRY_RUN", "1") != "0"
 
 WAIVER_SMS_TEMPLATES = {
     "k1_speed": {
@@ -253,6 +267,183 @@ def send_telnyx_sms(*, from_number: str, to_number: str, text: str) -> dict[str,
         raise HTTPException(status_code=502, detail=f"Telnyx Messages API error {exc.code}: {detail[:500]}") from exc
     except URLError as exc:
         raise HTTPException(status_code=502, detail=f"Telnyx Messages API request failed: {exc.reason}") from exc
+
+
+def _clean_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _first_payload_value(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in payload and payload.get(key) not in (None, ""):
+            return payload.get(key)
+    return None
+
+
+def _compact_dict(values: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key, value in values.items():
+        if value in (None, "", [], {}):
+            continue
+        compact[key] = value
+    return compact
+
+
+def build_tripleseat_lead(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize assistant-friendly input into a Tripleseat lead payload."""
+    raw_nested = payload.get("lead")
+    nested: dict[str, Any] = raw_nested if isinstance(raw_nested, dict) else {}
+    source = {**payload, **nested}
+
+    full_name = _clean_str(_first_payload_value(source, "name", "full_name", "customer_name", "contact_name"))
+    first_name = _clean_str(_first_payload_value(source, "first_name", "firstName"))
+    last_name = _clean_str(_first_payload_value(source, "last_name", "lastName"))
+    if full_name and not (first_name or last_name):
+        parts = full_name.split()
+        first_name = parts[0]
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else None
+
+    event_description = _clean_str(
+        _first_payload_value(
+            source,
+            "event_description",
+            "description",
+            "notes",
+            "additional_information",
+            "special_requests",
+        )
+    )
+    event_type = _clean_str(_first_payload_value(source, "event_type", "reservation_type", "occasion"))
+    if event_type and event_description:
+        event_description = f"{event_type}: {event_description}"
+    elif event_type:
+        event_description = event_type
+
+    lead = _compact_dict(
+        {
+            "first_name": first_name,
+            "last_name": last_name,
+            "email_address": _first_payload_value(source, "email_address", "email"),
+            "phone_number": _first_payload_value(source, "phone_number", "phone", "mobile_phone"),
+            "company": _first_payload_value(source, "company", "account_name"),
+            "event_description": event_description,
+            "event_date": _first_payload_value(source, "event_date", "date", "reservation_date"),
+            "start_time": _first_payload_value(source, "start_time", "time", "reservation_time"),
+            "end_time": _first_payload_value(source, "end_time"),
+            "guest_count": _first_payload_value(source, "guest_count", "guests", "party_size", "pax"),
+            "location_id": _first_payload_value(source, "location_id") or TRIPLESEAT_DEFAULT_LOCATION_ID,
+            "room_id": _first_payload_value(source, "room_id", "space_id"),
+            "source": _first_payload_value(source, "source") or TRIPLESEAT_DEFAULT_LEAD_SOURCE,
+            "referral_source": _first_payload_value(source, "referral_source"),
+            "additional_information": _first_payload_value(source, "additional_information", "assistant_summary"),
+        }
+    )
+    raw_passthrough = source.get("tripleseat_fields")
+    passthrough: dict[str, Any] = raw_passthrough if isinstance(raw_passthrough, dict) else {}
+    lead.update(_compact_dict(passthrough))
+    return {"lead": lead}
+
+
+def build_tripleseat_booking(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize assistant-friendly input into a Tripleseat booking payload."""
+    raw_nested = payload.get("booking")
+    nested: dict[str, Any] = raw_nested if isinstance(raw_nested, dict) else {}
+    source = {**payload, **nested}
+    booking = _compact_dict(
+        {
+            "name": _first_payload_value(source, "name", "booking_name", "event_name") or "Assistant-created booking",
+            "start_date": _first_payload_value(source, "start_date", "event_date", "date", "reservation_date"),
+            "end_date": _first_payload_value(source, "end_date", "event_date", "date", "reservation_date"),
+            "start_time": _first_payload_value(source, "start_time", "time", "reservation_time"),
+            "end_time": _first_payload_value(source, "end_time"),
+            "location_id": _first_payload_value(source, "location_id") or TRIPLESEAT_DEFAULT_LOCATION_ID,
+            "guest_count": _first_payload_value(source, "guest_count", "guests", "party_size", "pax"),
+            "description": _first_payload_value(source, "description", "notes", "special_requests"),
+        }
+    )
+    raw_passthrough = source.get("tripleseat_fields")
+    passthrough: dict[str, Any] = raw_passthrough if isinstance(raw_passthrough, dict) else {}
+    booking.update(_compact_dict(passthrough))
+    return {"booking": booking}
+
+
+def _missing_required_fields(record: dict[str, Any], required: tuple[str, ...]) -> list[str]:
+    return [field for field in required if record.get(field) in (None, "")]
+
+
+def post_tripleseat_resource(resource: str, body: dict[str, Any], *, dry_run: bool | None = None) -> dict[str, Any]:
+    """Post a lead/booking to Tripleseat, or return a Tripleseat-shaped dry run."""
+    is_dry_run = TRIPLESEAT_DRY_RUN if dry_run is None else dry_run
+    if resource == "lead":
+        endpoint = TRIPLESEAT_LEAD_ENDPOINT
+        key = "lead"
+        required = ("first_name", "phone_number")
+        params = {"public_key": TRIPLESEAT_PUBLIC_KEY} if TRIPLESEAT_PUBLIC_KEY else {}
+        auth_header = None
+    elif resource == "booking":
+        endpoint = TRIPLESEAT_BOOKING_ENDPOINT
+        key = "booking"
+        required = ("name", "start_date", "location_id")
+        params = {}
+        auth_header = f"Bearer {TRIPLESEAT_ACCESS_TOKEN}" if TRIPLESEAT_ACCESS_TOKEN else None
+    else:  # pragma: no cover - guarded by callers
+        raise HTTPException(status_code=400, detail="Unsupported Tripleseat resource")
+
+    raw_record = body.get(key)
+    record: dict[str, Any] = raw_record if isinstance(raw_record, dict) else {}
+    missing = _missing_required_fields(record, required)
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required Tripleseat {resource} fields: {', '.join(missing)}")
+
+    url = endpoint
+    if params:
+        url = f"{endpoint}?{urlencode(params)}"
+
+    if is_dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "provider": "tripleseat",
+            "resource": resource,
+            "method": "POST",
+            "url": endpoint,
+            "requires": "TRIPLESEAT_PUBLIC_KEY" if resource == "lead" else "TRIPLESEAT_ACCESS_TOKEN",
+            "request_body": body,
+            "message": f"Dry run only. Set TRIPLESEAT_DRY_RUN=0 and configure credentials to create a Tripleseat {resource}.",
+        }
+
+    if resource == "lead" and not TRIPLESEAT_PUBLIC_KEY:
+        raise HTTPException(status_code=500, detail="TRIPLESEAT_PUBLIC_KEY is not configured")
+    if resource == "booking" and not TRIPLESEAT_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="TRIPLESEAT_ACCESS_TOKEN is not configured")
+
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    req = urlrequest.Request(url, data=json.dumps(body).encode("utf-8"), method="POST", headers=headers)
+    try:
+        with urlrequest.urlopen(req, timeout=15) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+            try:
+                response_data = json.loads(response_text or "{}")
+            except json.JSONDecodeError:
+                response_data = {"raw": response_text}
+            return {
+                "ok": 200 <= response.status < 300,
+                "dry_run": False,
+                "provider": "tripleseat",
+                "resource": resource,
+                "status_code": response.status,
+                "response": response_data,
+            }
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Tripleseat API error {exc.code}: {detail[:500]}") from exc
+    except URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Tripleseat API request failed: {exc.reason}") from exc
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -1386,6 +1577,61 @@ async def send_waiver_sms_tool(
         "message_id": message_id,
         "message": f"Sent {template['display_name']} waiver link by SMS.",
     }
+
+
+@app.post("/telnyx/tools/tripleseat/create-lead")
+async def tripleseat_create_lead_tool(
+    request: Request,
+    dry_run: bool | None = Query(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    check_secret(x_webhook_secret, request.query_params.get("secret"))
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    body = build_tripleseat_lead(payload)
+    result = post_tripleseat_resource("lead", body, dry_run=dry_run)
+    return {**result, "tool": "tripleseat-create-lead"}
+
+
+@app.post("/telnyx/tools/tripleseat/create-reservation")
+async def tripleseat_create_reservation_tool(
+    request: Request,
+    dry_run: bool | None = Query(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    check_secret(x_webhook_secret, request.query_params.get("secret"))
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    payload = {**payload, "event_type": payload.get("event_type") or payload.get("reservation_type") or "Reservation"}
+    body = build_tripleseat_lead(payload)
+    result = post_tripleseat_resource("lead", body, dry_run=dry_run)
+    return {**result, "tool": "tripleseat-create-reservation"}
+
+
+@app.post("/telnyx/tools/tripleseat/create-booking")
+async def tripleseat_create_booking_tool(
+    request: Request,
+    dry_run: bool | None = Query(default=None),
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    check_secret(x_webhook_secret, request.query_params.get("secret"))
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    body = build_tripleseat_booking(payload)
+    result = post_tripleseat_resource("booking", body, dry_run=dry_run)
+    return {**result, "tool": "tripleseat-create-booking"}
 
 
 @app.post("/telnyx/tools/async/{tool_name}")

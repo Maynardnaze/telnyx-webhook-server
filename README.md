@@ -129,6 +129,11 @@ Runtime configuration is managed in Doppler. Do not keep long-lived `.env` files
 | `WEBHOOK_SECRET` | Yes | Shared secret for admin login and protected endpoints |
 | `TELNYX_PUBLIC_KEY` | Production: yes | Telnyx Ed25519 public key for `/telnyx/insights` signature verification |
 | `TELNYX_API_KEY` | Feature-dependent | Telnyx REST API key for assistant names, Add Messages, and SMS helpers |
+| `TRIPLESEAT_PUBLIC_KEY` | Feature-dependent | Tripleseat public lead-form API key for creating leads from assistant tools |
+| `TRIPLESEAT_ACCESS_TOKEN` | Feature-dependent | Tripleseat OAuth bearer token for booking/event API calls when enabled |
+| `TRIPLESEAT_DRY_RUN` | No | Defaults to `1`; set to `0` only after Tripleseat credentials and field mapping are verified |
+| `TRIPLESEAT_DEFAULT_LOCATION_ID` | No | Default Tripleseat location used when assistant payload omits `location_id` |
+| `TRIPLESEAT_DEFAULT_LEAD_SOURCE` | No | Source label for assistant-created leads; default `Telnyx Assistant` |
 | `WEBHOOK_ALLOW_NO_SECRET` | Local/CI only | Set to `1` only for isolated local dev or CI; never production |
 | `WEBHOOK_INSIGHTS_PATH` | No | Legacy JSON path; used only for one-time migration into SQLite |
 | `TZ` | Yes | Container timezone |
@@ -198,6 +203,9 @@ To force a fresh import:
 | `POST /telnyx/insights` | Yes | Telnyx Ed25519 signature **or** shared secret |
 | `GET /telnyx/insights` | Yes | Shared secret header or `?secret=` query param |
 | `POST /telnyx/tools/async/{tool_name}` | Yes | Shared secret header or `?secret=` query param, plus `x-telnyx-call-control-id` |
+| `POST /telnyx/tools/tripleseat/create-lead` | Yes | Shared secret header or `?secret=` query param |
+| `POST /telnyx/tools/tripleseat/create-reservation` | Yes | Shared secret header or `?secret=` query param |
+| `POST /telnyx/tools/tripleseat/create-booking` | Yes | Shared secret header or `?secret=` query param |
 
 Do **not** put OAuth, Authelia, or Cloudflare Access in front of this route unless Telnyx can satisfy that challenge. Use Telnyx signature verification and the shared secret for app-level protection instead.
 
@@ -261,6 +269,53 @@ Real Telnyx deliveries should show:
 ```
 
 For field-by-field documentation, result format variations, and full payload examples, see [docs/telnyx-insights.md](docs/telnyx-insights.md).
+
+### Tripleseat assistant tools
+
+These shared-secret-protected endpoints let a Telnyx assistant collect event/reservation details and hand them to Tripleseat-shaped tools. They default to dry-run mode so you can test assistant prompts without creating live Tripleseat records.
+
+- `POST /telnyx/tools/tripleseat/create-lead` — normalizes assistant input into `{ "lead": { ... } }` and posts to Tripleseat's lead-create endpoint when live mode is enabled.
+- `POST /telnyx/tools/tripleseat/create-reservation` — same as lead creation, but defaults `event_type` to `Reservation` for restaurant/reservation conversations.
+- `POST /telnyx/tools/tripleseat/create-booking` — normalizes input into `{ "booking": { ... } }` for Tripleseat booking/event creation. Use only after OAuth/API access is verified.
+
+Example dry-run lead request:
+
+```bash
+curl -s https://webhook.miswitch.cloud/telnyx/tools/tripleseat/create-lead \
+  -H 'content-type: application/json' \
+  -H 'x-webhook-secret: <secret>' \
+  -d '{
+    "name":"Jane Guest",
+    "phone":"248-555-1212",
+    "email":"jane@example.com",
+    "event_type":"Birthday party",
+    "event_date":"2026-08-15",
+    "time":"7:00 PM",
+    "guests":24,
+    "notes":"Needs private room if available."
+  }'
+```
+
+Expected dry-run response includes the exact Tripleseat-shaped request body:
+
+```json
+{
+  "ok": true,
+  "dry_run": true,
+  "provider": "tripleseat",
+  "resource": "lead",
+  "request_body": {
+    "lead": {
+      "first_name": "Jane",
+      "last_name": "Guest",
+      "phone_number": "248-555-1212",
+      "event_description": "Birthday party: Needs private room if available."
+    }
+  }
+}
+```
+
+Live lead creation requires `TRIPLESEAT_PUBLIC_KEY` and `TRIPLESEAT_DRY_RUN=0` in Doppler. Live booking creation requires `TRIPLESEAT_ACCESS_TOKEN` and `TRIPLESEAT_DRY_RUN=0`.
 
 ## Telnyx setup
 

@@ -40,6 +40,11 @@ Create these secrets/config values in Doppler. Include non-secret config too if 
 | WEBHOOK_SECRET | Yes | Yes | secrets/telnyx_webhook_secret or env | Admin login + protected API endpoints |
 | TELNYX_PUBLIC_KEY | Production: yes | No | .env | Telnyx Ed25519 webhook signing public key |
 | TELNYX_API_KEY | Only outbound Telnyx API/SMS tools | Yes | secrets/telnyx_api_key or env | Used for Add Messages / SMS helper code |
+| TRIPLESEAT_PUBLIC_KEY | Only Tripleseat lead tools | Yes | Doppler | Public lead-form API key for `/v1/leads/create.json` |
+| TRIPLESEAT_ACCESS_TOKEN | Only Tripleseat booking tools | Yes | Doppler | OAuth bearer token for booking/event API calls |
+| TRIPLESEAT_DRY_RUN | No | No | Doppler | Default `1`; set `0` only after field mapping is verified |
+| TRIPLESEAT_DEFAULT_LOCATION_ID | No | No | Doppler | Default location ID for assistant-created Tripleseat records |
+| TRIPLESEAT_DEFAULT_LEAD_SOURCE | No | No | Doppler | Default source label, e.g. `Telnyx Assistant` |
 | ASSISTANT_MEMORY_FAMILY | No | No | Compose default | Default: miswitch-ai-assistants |
 | ASSISTANT_MEMORY_LIMIT | No | No | Compose default | Default: 5 |
 | ASSISTANT_MEMORY_INSIGHT_QUERY | No | No | Compose default | Optional query/filter string |
@@ -143,6 +148,11 @@ services:
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:?WEBHOOK_SECRET must be supplied by Doppler}
       TELNYX_PUBLIC_KEY: ${TELNYX_PUBLIC_KEY:?TELNYX_PUBLIC_KEY must be supplied by Doppler}
       TELNYX_API_KEY: ${TELNYX_API_KEY:-}
+      TRIPLESEAT_PUBLIC_KEY: ${TRIPLESEAT_PUBLIC_KEY:-}
+      TRIPLESEAT_ACCESS_TOKEN: ${TRIPLESEAT_ACCESS_TOKEN:-}
+      TRIPLESEAT_DRY_RUN: ${TRIPLESEAT_DRY_RUN:-1}
+      TRIPLESEAT_DEFAULT_LOCATION_ID: ${TRIPLESEAT_DEFAULT_LOCATION_ID:-}
+      TRIPLESEAT_DEFAULT_LEAD_SOURCE: ${TRIPLESEAT_DEFAULT_LEAD_SOURCE:-Telnyx Assistant}
       ASSISTANT_MEMORY_FAMILY: ${ASSISTANT_MEMORY_FAMILY:-miswitch-ai-assistants}
       ASSISTANT_MEMORY_LIMIT: ${ASSISTANT_MEMORY_LIMIT:-5}
       ASSISTANT_MEMORY_INSIGHT_QUERY: ${ASSISTANT_MEMORY_INSIGHT_QUERY:-}
