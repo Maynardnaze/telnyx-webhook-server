@@ -37,6 +37,10 @@ def configure_tmp_db(tmp_path: Path):
     webhook_app.ASSISTANT_NAMES_JSON = ""
     webhook_app.DB_PATH = tmp_path / "webhook.db"
     webhook_app._LEGACY_INSIGHTS_PATH = tmp_path / "insights.json"
+    webhook_app.TRIPLESEAT_DRY_RUN = True
+    webhook_app.TRIPLESEAT_PUBLIC_KEY = None
+    webhook_app.TRIPLESEAT_ACCESS_TOKEN = None
+    webhook_app.TRIPLESEAT_DEFAULT_LOCATION_ID = ""
     webhook_app.init_db()
 
 
@@ -260,3 +264,64 @@ def test_admin_webhook_simulator_stores_insight(tmp_path):
     assert response.status_code == 200
     assert "Stored insight" in response.text
     assert client.get("/admin/api/stats").json()["insight_count"] == 1
+
+
+def test_tripleseat_create_lead_tool_dry_run(tmp_path):
+    configure_tmp_db(tmp_path)
+    client = TestClient(webhook_app.app)
+
+    response = client.post(
+        "/telnyx/tools/tripleseat/create-lead",
+        headers={"x-webhook-secret": SECRET},
+        json={
+            "name": "Jane Guest",
+            "phone": "248-555-1212",
+            "email": "jane@example.com",
+            "event_type": "Birthday party",
+            "event_date": "2026-08-15",
+            "time": "7:00 PM",
+            "guests": 24,
+            "notes": "Needs private room if available.",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tool"] == "tripleseat-create-lead"
+    assert body["dry_run"] is True
+    assert body["request_body"]["lead"]["first_name"] == "Jane"
+    assert body["request_body"]["lead"]["last_name"] == "Guest"
+    assert body["request_body"]["lead"]["phone_number"] == "248-555-1212"
+    assert body["request_body"]["lead"]["guest_count"] == 24
+    assert body["request_body"]["lead"]["event_description"] == "Birthday party: Needs private room if available."
+
+
+def test_tripleseat_create_reservation_tool_marks_reservation(tmp_path):
+    configure_tmp_db(tmp_path)
+    client = TestClient(webhook_app.app)
+
+    response = client.post(
+        "/telnyx/tools/tripleseat/create-reservation?dry_run=true",
+        headers={"x-webhook-secret": SECRET},
+        json={"first_name": "Alex", "phone_number": "+12485550100", "party_size": 4, "reservation_date": "2026-07-02"},
+    )
+
+    assert response.status_code == 200
+    lead = response.json()["request_body"]["lead"]
+    assert response.json()["tool"] == "tripleseat-create-reservation"
+    assert lead["event_description"] == "Reservation"
+    assert lead["guest_count"] == 4
+
+
+def test_tripleseat_create_booking_requires_location(tmp_path):
+    configure_tmp_db(tmp_path)
+    client = TestClient(webhook_app.app)
+
+    response = client.post(
+        "/telnyx/tools/tripleseat/create-booking",
+        headers={"x-webhook-secret": SECRET},
+        json={"name": "Corporate Event", "start_date": "2026-09-01"},
+    )
+
+    assert response.status_code == 400
+    assert "location_id" in response.json()["detail"]
