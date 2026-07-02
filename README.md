@@ -33,6 +33,9 @@ telnyx-webhook-server/
 │   └── telnyx-insights.md # Insight Group webhook format and examples
 ├── templates/             # Server-rendered admin UI pages
 ├── static/                # Admin UI CSS/JS
+├── tests/                 # Pytest suite (also run by GitHub Actions CI)
+├── requirements.txt       # Runtime dependencies (used by the Docker build)
+├── requirements-dev.txt   # Runtime + test dependencies for local development
 ├── docker-compose.yml     # Production Compose stack; expects Doppler-injected env vars
 ├── Dockerfile
 └── data/                  # Runtime data (gitignored except .gitkeep)
@@ -74,8 +77,16 @@ Install dependencies:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install fastapi 'uvicorn[standard]' pynacl
+pip install -r requirements-dev.txt
 ```
+
+Run the test suite:
+
+```bash
+pytest tests/ -q
+```
+
+Tests also run automatically in GitHub Actions on every push and pull request (`.github/workflows/ci.yml`).
 
 Run with Doppler-managed config:
 
@@ -113,11 +124,12 @@ The first admin frontend is intentionally simple and served by FastAPI from the 
 | `/admin` | Dashboard — delivery counts, sentiment/resolution breakdown, recent conversations |
 | `/admin/insights` | Conversation list with channel, sentiment, and intent badges |
 | `/admin/insights/{id}` | Detail view with all five MySwitch insight cards plus raw JSON |
+| `/admin/insights/{id}` (Review panel) | Set review status/labels/note — persisted server-side in SQLite |
 | `/admin/tools/assistant-init` | Test the local Dynamic Variables Webhook response builder |
 | `/admin/tools/async-jobs` | Review dry-run async tool jobs and prepared Add Messages payloads |
 | `/admin/tools/webhook-simulator` | Store a sample insight payload without calling external APIs |
 
-Admin sessions use a signed `admin_session` cookie derived from `WEBHOOK_SECRET`; no separate user database is created. Do not expose `/admin/*` to other users until you add stronger auth or path-specific access control such as Authelia/Cloudflare Access. Keep `/telnyx/*` free from browser-style auth challenges so Telnyx can continue posting signed webhooks.
+Admin sessions use a signed `admin_session` cookie derived from `WEBHOOK_SECRET`; no separate user database is created. Login is rate-limited per client IP (default 5 failed attempts per 15 minutes, then `429`; tune with `ADMIN_LOGIN_MAX_FAILURES` / `ADMIN_LOGIN_FAILURE_WINDOW_SECONDS`). Unauthenticated requests to `/admin/api/*` JSON endpoints return `401` instead of redirecting to the login page. Do not expose `/admin/*` to other users until you add stronger auth or path-specific access control such as Authelia/Cloudflare Access. Keep `/telnyx/*` free from browser-style auth challenges so Telnyx can continue posting signed webhooks.
 
 ## Configuration
 
@@ -142,6 +154,10 @@ Runtime configuration is managed in Doppler. Do not keep long-lived `.env` files
 | `ASSISTANT_MEMORY_LIMIT` | No | Conversation memory query limit; default `5` |
 | `ASSISTANT_MEMORY_INSIGHT_QUERY` | No | Optional insight-memory query/filter string |
 | `ASSISTANT_MEMORY_PROFILES` | No | Optional per-assistant profile JSON |
+| `ASSISTANT_NAMES_REFRESH_SECONDS` | No | Telnyx assistant-name cache TTL; default `900` |
+| `ASSISTANT_NAMES_FAILURE_RETRY_SECONDS` | No | Backoff before retrying a failed Telnyx assistant-name lookup; default `60` |
+| `ADMIN_LOGIN_MAX_FAILURES` | No | Failed admin logins allowed per IP before lockout; default `5` |
+| `ADMIN_LOGIN_FAILURE_WINDOW_SECONDS` | No | Sliding window for the login lockout; default `900` |
 
 ### Shared secret
 
@@ -175,6 +191,7 @@ Insight payloads are stored in a single SQLite file:
 | Table | Contents | Retention |
 |-------|----------|-----------|
 | `insights` | Received Telnyx Insight Group payloads | Last **500** records (oldest pruned on insert) |
+| `insight_reviews` | Admin triage state per insight (status, labels, note) | Deleted automatically when the matching insight is pruned |
 
 The `./data` directory is bind-mounted into the container at `/data`. Back up by copying `data/webhook.db`.
 
@@ -316,6 +333,17 @@ Expected dry-run response includes the exact Tripleseat-shaped request body:
 ```
 
 Live lead creation requires `TRIPLESEAT_PUBLIC_KEY` and `TRIPLESEAT_DRY_RUN=0` in Doppler. Live booking creation requires `TRIPLESEAT_ACCESS_TOKEN` and `TRIPLESEAT_DRY_RUN=0`.
+
+### Insight review triage (admin API)
+
+The admin UI's review panel persists triage state to SQLite through these session-cookie-protected endpoints (they answer `401` without a valid `admin_session` cookie):
+
+- `GET /admin/api/reviews` — all review records keyed by insight id
+- `GET /admin/api/reviews/{insight_id}` — one review (`status: new` default if untouched)
+- `PUT /admin/api/reviews/{insight_id}` — upsert `{"status": "new|reviewed|follow-up|ignored", "labels": ["vip"], "note": "..."}`
+- `DELETE /admin/api/reviews/{insight_id}` — reset to `new`
+
+Review state feeds the dashboard: conversations marked `reviewed`/`ignored` drop off the **Needs review** KPI, `follow-up` always stays on it, and `review_counts` is included in `GET /admin/api/stats`.
 
 ## Telnyx setup
 

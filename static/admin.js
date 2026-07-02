@@ -1,4 +1,3 @@
-const REVIEW_KEY = 'miswitch_reviews';
 const REVIEW_STATUSES = [
   { key: 'new', label: 'New' },
   { key: 'reviewed', label: 'Reviewed' },
@@ -7,54 +6,44 @@ const REVIEW_STATUSES = [
 ];
 const REVIEW_LABELS = ['no-name', 'transfer-failed', 'low-confidence', 'vip', 'spam'];
 
-function readReviews() {
-  try {
-    return JSON.parse(localStorage.getItem(REVIEW_KEY) || '{}');
-  } catch {
-    return {};
-  }
-}
-
-function writeReviews(data) {
-  localStorage.setItem(REVIEW_KEY, JSON.stringify(data));
-}
-
-function effectiveReview(id, fallback = 'new') {
-  return readReviews()[id]?.status || fallback;
-}
-
-function decorateReviewPills(root = document) {
-  root.querySelectorAll('[data-review-id]').forEach((el) => {
-    const id = el.dataset.reviewId;
-    const status = effectiveReview(id, el.dataset.reviewDefault || 'new');
-    el.textContent = REVIEW_STATUSES.find((s) => s.key === status)?.label || status;
-    el.className = `pill review-${status.replace('/', '-')}`;
-  });
-  root.querySelectorAll('[data-row-id]').forEach((row) => {
-    const status = effectiveReview(row.dataset.rowId, row.dataset.reviewDefault || 'new');
-    const flagged = row.dataset.flagged === '1' || status === 'follow-up';
-    row.classList.toggle('flagged', flagged);
-    const flag = row.querySelector('[data-row-flag]');
-    if (flag) flag.style.visibility = flagged ? 'visible' : 'hidden';
-  });
-}
-
 function initReviewPanel() {
   const panel = document.querySelector('[data-review-panel]');
   if (!panel) return;
 
   const insightId = panel.dataset.insightId;
-  const reviews = readReviews();
-  const saved = reviews[insightId] || { status: 'new', labels: [] };
+  let labels;
+  try {
+    labels = JSON.parse(panel.dataset.reviewLabels || '[]');
+  } catch {
+    labels = [];
+  }
+  const state = { status: panel.dataset.reviewStatus || 'new', labels };
   const statusGrid = panel.querySelector('[data-review-status-grid]');
   const labelGrid = panel.querySelector('[data-review-label-grid]');
-  const note = panel.querySelector('[data-review-note]');
+  const noteStatus = panel.querySelector('[data-review-note]');
+  const noteInput = panel.querySelector('[data-review-note-input]');
 
-  const persist = (next) => {
-    reviews[insightId] = next;
-    writeReviews(reviews);
-    decorateReviewPills();
-    if (note) note.textContent = `persisted locally · ${new Date().toLocaleString()}`;
+  const setNoteStatus = (text, isError = false) => {
+    if (!noteStatus) return;
+    noteStatus.textContent = text;
+    noteStatus.classList.toggle('error-text', isError);
+  };
+
+  const persist = async () => {
+    setNoteStatus('saving…');
+    try {
+      const response = await fetch(`/admin/api/reviews/${encodeURIComponent(insightId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ status: state.status, labels: state.labels, note: noteInput?.value || '' }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const saved = await response.json();
+      setNoteStatus(saved.updated_at ? `saved · ${new Date(saved.updated_at).toLocaleString()}` : 'not reviewed yet');
+    } catch (err) {
+      setNoteStatus(`save failed: ${err.message || err}`, true);
+    }
   };
 
   if (statusGrid) {
@@ -62,14 +51,15 @@ function initReviewPanel() {
     REVIEW_STATUSES.forEach((item) => {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = `review-option${saved.status === item.key ? ` active-${item.key}` : ''}`;
+      btn.className = `review-option${state.status === item.key ? ` active-${item.key}` : ''}`;
       btn.textContent = item.label;
       btn.addEventListener('click', () => {
-        persist({ ...saved, status: item.key });
+        state.status = item.key;
         statusGrid.querySelectorAll('.review-option').forEach((el) => {
           el.className = 'review-option';
         });
         btn.className = `review-option active-${item.key}`;
+        persist();
       });
       statusGrid.appendChild(btn);
     });
@@ -80,20 +70,26 @@ function initReviewPanel() {
     REVIEW_LABELS.forEach((label) => {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = `label-chip${saved.labels?.includes(label) ? ' active' : ''}`;
+      btn.className = `label-chip${state.labels.includes(label) ? ' active' : ''}`;
       btn.textContent = label;
       btn.addEventListener('click', () => {
-        const labels = new Set(saved.labels || []);
-        if (labels.has(label)) labels.delete(label);
-        else labels.add(label);
-        const next = { ...saved, labels: [...labels] };
-        persist(next);
+        const next = new Set(state.labels);
+        if (next.has(label)) next.delete(label);
+        else next.add(label);
+        state.labels = [...next];
         btn.classList.toggle('active');
-        saved.labels = next.labels;
+        persist();
       });
       labelGrid.appendChild(btn);
     });
   }
+
+  noteInput?.addEventListener('blur', () => {
+    if (noteInput.value.trim() !== (panel.dataset.reviewNote || '').trim()) {
+      panel.dataset.reviewNote = noteInput.value;
+      persist();
+    }
+  });
 }
 
 function initClientFilter() {
@@ -214,5 +210,4 @@ document.addEventListener('DOMContentLoaded', () => {
   initReviewPanel();
   initClientFilter();
   initAssistantNameLoader();
-  decorateReviewPills();
 });

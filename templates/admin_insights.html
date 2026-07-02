@@ -50,15 +50,14 @@
     </div>
     {% if insights %}
       {% for item in insights %}
-      <a class="data-row" href="/admin/insights/{{ item.id }}" data-filter-item data-row-id="{{ item.id }}"
-         data-filter-text="{{ item.caller_name or '' }} {{ item.caller_phone or '' }} {{ item.summary or '' }} {{ item.intent_name or '' }} {{ item.primary_category or '' }} {{ item.conversation_id or '' }} {{ item.assistant_id or '' }} {{ item.assistant_name or '' }}"
+      {% set flagged = item.review_status == 'follow-up' or (item.review_status == 'new' and (item.resolution_key in ['unresolved', 'transferred'] or item.sentiment_label == 'Negative')) %}
+      <a class="data-row{% if flagged %} flagged{% endif %}" href="/admin/insights/{{ item.id }}" data-filter-item data-row-id="{{ item.id }}"
+         data-filter-text="{{ item.caller_name or '' }} {{ item.caller_phone or '' }} {{ item.summary or '' }} {{ item.intent_name or '' }} {{ item.primary_category or '' }} {{ item.conversation_id or '' }} {{ item.assistant_id or '' }} {{ item.assistant_name or '' }} {{ item.review_status or '' }} {{ item.review_labels|join(' ') }}"
          data-channel="{{ item.channel_short or '' }}"
          data-resolution="{{ item.resolution_key or '' }}"
          data-sentiment="{{ item.sentiment_label or '' }}"
-         data-flagged="{{ '1' if item.resolution_key in ['unresolved', 'transferred'] or item.sentiment_label == 'Negative' else '0' }}"
-         data-review-default="new"
          style="text-decoration:none; color:inherit;">
-        <div class="col-flag" data-row-flag style="visibility:{% if item.resolution_key in ['unresolved', 'transferred'] or item.sentiment_label == 'Negative' %}visible{% else %}hidden{% endif %};">⚑</div>
+        <div class="col-flag" data-row-flag style="visibility:{% if flagged %}visible{% else %}hidden{% endif %};">⚑</div>
         <div class="col-time">{{ item.received_at_short }}</div>
         <div class="col-chan"><span class="pill {{ item.channel_short }}">{{ item.channel_short }}</span></div>
         <div class="col-assistant">
@@ -69,7 +68,7 @@
         <div class="col-resolution"><span class="pill {{ item.resolution_key or 'unresolved' }}">{{ item.resolution_status or '—' }}</span></div>
         <div class="col-sentiment" style="color:{% if item.sentiment_label == 'Positive' %}var(--accent){% elif item.sentiment_label == 'Negative' %}var(--danger){% else %}var(--muted-4){% endif %};">{{ item.sentiment_label or '—' }}</div>
         <div class="col-summary">{{ item.summary }}</div>
-        <div class="col-review"><span class="pill review-new" data-review-id="{{ item.id }}">New</span></div>
+        <div class="col-review"><span class="pill review-{{ item.review_status }}">{{ item.review_status|capitalize }}</span></div>
         <div class="col-arrow">→</div>
       </a>
       {% endfor %}

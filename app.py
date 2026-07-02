@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -87,10 +88,12 @@ WAIVER_SMS_TEMPLATES = {
 ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", "/data/assistant-names.json"))
 ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
 ASSISTANT_NAMES_REFRESH_SECONDS = int(os.environ.get("ASSISTANT_NAMES_REFRESH_SECONDS", "900"))
+ASSISTANT_NAMES_FAILURE_RETRY_SECONDS = int(os.environ.get("ASSISTANT_NAMES_FAILURE_RETRY_SECONDS", "60"))
 ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS = os.environ.get("ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS") == "1"
 TELNYX_ASSISTANTS_URL = os.environ.get("TELNYX_ASSISTANTS_URL", "https://api.telnyx.com/v2/ai/assistants?page[size]=100")
 _assistant_names_cache: dict[str, str] = {}
 _assistant_names_cache_at = 0.0
+_assistant_names_failed_at = 0.0
 _assistant_names_status: dict[str, Any] = {"ok": False, "reason": "not_loaded", "count": 0}
 
 MYSWITCH_INSIGHT_GROUP_ID = "e58ece8c-f50b-47ed-86d9-8ec6483439c1"
@@ -104,11 +107,24 @@ MYSWITCH_INSIGHT_DEFINITIONS: list[dict[str, Any]] = [
 
 app = FastAPI(
     title="Miswitch Telnyx Webhook Server",
-    version="0.2.0",
+    version="0.3.0",
     description="Public webhook receiver for Telnyx behind webhook.miswitch.cloud.",
 )
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 app.mount("/admin/static", StaticFiles(directory=str(APP_DIR / "static"), check_dir=False), name="admin_static")
+
+
+@app.middleware("http")
+async def admin_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/admin" or path.startswith("/admin/"):
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        if not path.startswith("/admin/static"):
+            response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 def render_admin(request: Request, template_name: str, context: dict[str, Any], status_code: int = 200) -> HTMLResponse:
@@ -117,7 +133,9 @@ def render_admin(request: Request, template_name: str, context: dict[str, Any], 
         template_name,
         {
             **context,
-            "console_stats": get_insight_stats() if template_name != "admin_login.html" else None,
+            # The sidebar only needs record count + latest timestamp, so use the
+            # cheap SQL summary instead of recomputing full stats on every page.
+            "console_stats": get_console_summary() if template_name != "admin_login.html" else None,
             "myswitch_group_short": f"{MYSWITCH_INSIGHT_GROUP_ID[:8]}…{MYSWITCH_INSIGHT_GROUP_ID[-6:]}",
         },
         status_code=status_code,
@@ -131,10 +149,7 @@ def utc_now() -> str:
 
 
 def check_secret(x_webhook_secret: str | None, query_secret: str | None = None) -> None:
-    if ALLOW_NO_SECRET:
-        return
-    supplied = x_webhook_secret or query_secret
-    if supplied != WEBHOOK_SECRET:
+    if not has_valid_shared_secret(x_webhook_secret, query_secret):
         raise HTTPException(status_code=401, detail="Missing or invalid webhook secret")
 
 
@@ -176,10 +191,57 @@ def require_admin_response(request: Request) -> RedirectResponse | None:
     return RedirectResponse(url="/admin/login", status_code=303)
 
 
+def require_admin_api(request: Request) -> None:
+    """JSON admin endpoints answer 401 instead of redirecting to the login page."""
+    if not is_admin_request(request):
+        raise HTTPException(status_code=401, detail="Admin session required")
+
+
+_login_failures: dict[str, list[float]] = {}
+_login_failures_lock = threading.Lock()
+LOGIN_MAX_FAILURES = int(os.environ.get("ADMIN_LOGIN_MAX_FAILURES", "5"))
+LOGIN_FAILURE_WINDOW_SECONDS = int(os.environ.get("ADMIN_LOGIN_FAILURE_WINDOW_SECONDS", "900"))
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def login_rate_limited(client_ip: str) -> bool:
+    now = time.time()
+    with _login_failures_lock:
+        recent = [ts for ts in _login_failures.get(client_ip, []) if now - ts < LOGIN_FAILURE_WINDOW_SECONDS]
+        if recent:
+            _login_failures[client_ip] = recent
+        else:
+            _login_failures.pop(client_ip, None)
+        return len(recent) >= LOGIN_MAX_FAILURES
+
+
+def record_login_failure(client_ip: str) -> None:
+    with _login_failures_lock:
+        _login_failures.setdefault(client_ip, []).append(time.time())
+
+
+def clear_login_failures(client_ip: str) -> None:
+    with _login_failures_lock:
+        _login_failures.pop(client_ip, None)
+
+
 async def read_form_fields(request: Request) -> dict[str, str]:
     body = (await request.body()).decode("utf-8")
     parsed = parse_qs(body, keep_blank_values=True)
     return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+async def read_json_object(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    return payload
 
 
 def json_pretty(value: Any) -> str:
@@ -225,20 +287,15 @@ def verify_telnyx_signature(signature: str | None, timestamp: str | None, raw_bo
 def has_valid_shared_secret(x_webhook_secret: str | None, query_secret: str | None = None) -> bool:
     if ALLOW_NO_SECRET:
         return True
-    supplied = x_webhook_secret or query_secret
-    return supplied == WEBHOOK_SECRET
+    return _secret_matches(x_webhook_secret or query_secret)
 
 
 def _normalize_phone(value: Any) -> str:
-    phone = str(value or "").strip()
-    digits = re.sub(r"\D", "", phone)
-    if len(digits) == 10:
-        return "+1" + digits
-    if len(digits) == 11 and digits.startswith("1"):
-        return "+" + digits
-    if phone.startswith("+") and 8 <= len(digits) <= 15:
-        return "+" + digits
-    raise HTTPException(status_code=400, detail="Invalid phone number")
+    """Strict variant of normalize_phone for outbound SMS: E.164 or reject."""
+    phone = normalize_phone(value)
+    if not phone or not re.fullmatch(r"\+\d{8,15}", phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number")
+    return phone
 
 
 def send_telnyx_sms(*, from_number: str, to_number: str, text: str) -> dict[str, Any]:
@@ -466,6 +523,14 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_insights_received_at ON insights(received_at);
 
+                CREATE TABLE IF NOT EXISTS insight_reviews (
+                    insight_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'new',
+                    labels TEXT NOT NULL DEFAULT '[]',
+                    note TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS async_tool_jobs (
                     id TEXT PRIMARY KEY,
                     tool_name TEXT NOT NULL,
@@ -573,10 +638,14 @@ def load_local_assistant_name_map() -> dict[str, str]:
 
 def load_telnyx_assistant_name_map(force: bool = False) -> dict[str, str]:
     """Best-effort assistant name lookup from Telnyx, cached briefly for admin UI pages."""
-    global _assistant_names_cache, _assistant_names_cache_at, _assistant_names_status
+    global _assistant_names_cache, _assistant_names_cache_at, _assistant_names_failed_at, _assistant_names_status
     now = time.time()
     if not force and _assistant_names_cache and now - _assistant_names_cache_at < ASSISTANT_NAMES_REFRESH_SECONDS:
         _assistant_names_status = {"ok": True, "reason": "cache", "count": len(_assistant_names_cache), "cached": True}
+        return dict(_assistant_names_cache)
+    # A failed lookup is also cached briefly so a page render over many records
+    # does not hammer the Telnyx API once per record while it is unreachable.
+    if not force and now - _assistant_names_failed_at < ASSISTANT_NAMES_FAILURE_RETRY_SECONDS:
         return dict(_assistant_names_cache)
     api_key = env_or_file("TELNYX_API_KEY")
     if not api_key:
@@ -593,12 +662,15 @@ def load_telnyx_assistant_name_map(force: bool = False) -> dict[str, str]:
             status_code = getattr(response, "status", None) or getattr(response, "getcode", lambda: None)()
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
+        _assistant_names_failed_at = now
         _assistant_names_status = {"ok": False, "reason": "telnyx_http_error", "status_code": exc.code, "count": len(_assistant_names_cache)}
         return dict(_assistant_names_cache)
     except (OSError, URLError, TimeoutError) as exc:
+        _assistant_names_failed_at = now
         _assistant_names_status = {"ok": False, "reason": "telnyx_request_error", "error": str(exc), "count": len(_assistant_names_cache)}
         return dict(_assistant_names_cache)
     except json.JSONDecodeError as exc:
+        _assistant_names_failed_at = now
         _assistant_names_status = {"ok": False, "reason": "telnyx_json_error", "error": str(exc), "count": len(_assistant_names_cache)}
         return dict(_assistant_names_cache)
     items = payload.get("data") if isinstance(payload, dict) else payload
@@ -614,8 +686,10 @@ def load_telnyx_assistant_name_map(force: bool = False) -> dict[str, str]:
     if names:
         _assistant_names_cache = names
         _assistant_names_cache_at = now
+        _assistant_names_failed_at = 0.0
         _assistant_names_status = {"ok": True, "reason": "telnyx_api", "status_code": status_code, "count": len(names), "cached": False}
     else:
+        _assistant_names_failed_at = now
         _assistant_names_status = {"ok": False, "reason": "telnyx_returned_no_names", "status_code": status_code, "count": 0}
     return dict(_assistant_names_cache)
 
@@ -835,9 +909,105 @@ def append_insight(record: dict[str, Any]) -> None:
                     """,
                     (excess,),
                 )
+                conn.execute("DELETE FROM insight_reviews WHERE insight_id NOT IN (SELECT id FROM insights)")
             conn.commit()
         finally:
             conn.close()
+
+
+REVIEW_STATUSES = ("new", "reviewed", "follow-up", "ignored")
+REVIEW_MAX_LABELS = 12
+REVIEW_MAX_LABEL_LENGTH = 40
+REVIEW_MAX_NOTE_LENGTH = 2000
+
+
+def default_review(insight_id: str) -> dict[str, Any]:
+    return {"insight_id": insight_id, "status": "new", "labels": [], "note": "", "updated_at": None}
+
+
+def _decode_review_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        labels = json.loads(row["labels"] or "[]")
+    except json.JSONDecodeError:
+        labels = []
+    if not isinstance(labels, list):
+        labels = []
+    return {
+        "insight_id": row["insight_id"],
+        "status": row["status"],
+        "labels": [str(label) for label in labels],
+        "note": row["note"] or "",
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_insight_review(insight_id: str) -> dict[str, Any] | None:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            row = conn.execute("SELECT * FROM insight_reviews WHERE insight_id = ?", (insight_id,)).fetchone()
+        finally:
+            conn.close()
+    return _decode_review_row(row) if row else None
+
+
+def list_insight_reviews() -> dict[str, dict[str, Any]]:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            rows = conn.execute("SELECT * FROM insight_reviews").fetchall()
+        finally:
+            conn.close()
+    return {row["insight_id"]: _decode_review_row(row) for row in rows}
+
+
+def upsert_insight_review(insight_id: str, status: str, labels: list[str], note: str) -> dict[str, Any]:
+    updated_at = utc_now()
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO insight_reviews (insight_id, status, labels, note, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(insight_id) DO UPDATE SET
+                    status = excluded.status, labels = excluded.labels,
+                    note = excluded.note, updated_at = excluded.updated_at
+                """,
+                (insight_id, status, json.dumps(labels, separators=(",", ":")), note, updated_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return {"insight_id": insight_id, "status": status, "labels": labels, "note": note, "updated_at": updated_at}
+
+
+def delete_insight_review(insight_id: str) -> None:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute("DELETE FROM insight_reviews WHERE insight_id = ?", (insight_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def validate_review_payload(payload: dict[str, Any]) -> tuple[str, list[str], str]:
+    status = str(payload.get("status") or "new").strip().lower()
+    if status not in REVIEW_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid review status. Expected one of: {', '.join(REVIEW_STATUSES)}")
+    raw_labels = payload.get("labels") or []
+    if not isinstance(raw_labels, list):
+        raise HTTPException(status_code=400, detail="Review labels must be a JSON array of strings")
+    labels: list[str] = []
+    for raw in raw_labels:
+        label = str(raw).strip()[:REVIEW_MAX_LABEL_LENGTH]
+        if label and label not in labels:
+            labels.append(label)
+    if len(labels) > REVIEW_MAX_LABELS:
+        raise HTTPException(status_code=400, detail=f"Too many review labels (max {REVIEW_MAX_LABELS})")
+    note = str(payload.get("note") or "").strip()[:REVIEW_MAX_NOTE_LENGTH]
+    return status, labels, note
 
 
 def redact_phone(value: Any) -> Any:
@@ -1038,10 +1208,6 @@ def get_insight_by_id(insight_id: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def json_pretty(value: Any) -> str:
-    return json.dumps(value, indent=2, sort_keys=True, default=str)
-
-
 def format_received_at(iso: str | None) -> str:
     if not iso:
         return "—"
@@ -1127,7 +1293,7 @@ def caller_display_name(parsed_results: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
+def extract_insight_fields(record: dict[str, Any], name_map: dict[str, str] | None = None) -> dict[str, Any]:
     payload, inner, metadata = unwrap_insight_event(record)
     parsed_results = parse_myswitch_results(inner)
     by_key = {item["key"]: item for item in parsed_results}
@@ -1159,7 +1325,7 @@ def extract_insight_fields(record: dict[str, Any]) -> dict[str, Any]:
     caller_phone = normalize_phone(metadata.get("telnyx_end_user_target") or metadata.get("from") or inner.get("from"))
     agent_phone = normalize_phone(metadata.get("telnyx_agent_target") or metadata.get("to") or inner.get("to"))
     assistant_id = first_present(metadata.get("assistant_id"), inner.get("assistant_id"))
-    assistant_names = load_assistant_name_map()
+    assistant_names = name_map if name_map is not None else load_assistant_name_map()
     assistant_name = (assistant_names.get(assistant_id) if assistant_id else None) or assistant_name_from_payload(payload, inner, metadata) or assistant_name_for(assistant_id, assistant_names)
     resolution_key = "unresolved"
     if resolution_status:
@@ -1219,6 +1385,7 @@ def build_insight_detail_context(record: dict[str, Any]) -> dict[str, Any]:
     payload, inner, metadata = unwrap_insight_event(record)
     parsed_results = parse_myswitch_results(inner)
     fields = extract_insight_fields(record)
+    insight_id = str(record.get("id") or "")
     return {
         "record": record,
         "fields": fields,
@@ -1226,8 +1393,24 @@ def build_insight_detail_context(record: dict[str, Any]) -> dict[str, Any]:
         "inner": inner,
         "metadata": metadata,
         "parsed_results": parsed_results,
+        "review": get_insight_review(insight_id) or default_review(insight_id),
         "pretty_json": json_pretty(record),
         "myswitch_group": MYSWITCH_INSIGHT_GROUP_ID,
+    }
+
+
+def get_console_summary() -> dict[str, Any]:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            row = conn.execute("SELECT COUNT(*), MAX(received_at) FROM insights").fetchone()
+        finally:
+            conn.close()
+    count, latest = row[0], row[1]
+    return {
+        "insight_count": count,
+        "latest_received_at": latest,
+        "latest_received_at_display": format_received_at(latest) if latest else None,
     }
 
 
@@ -1243,12 +1426,15 @@ def get_insight_stats() -> dict[str, Any]:
     latest_received_at = None
     contained_count = 0
     needs_review_count = 0
+    review_counts: dict[str, int] = {}
+    name_map = load_assistant_name_map()
+    reviews = list_insight_reviews()
     for record in insights:
         if record.get("telnyx_signature_verified"):
             signature_verified += 1
         if record.get("shared_secret_verified"):
             shared_secret_verified += 1
-        fields = extract_insight_fields(record)
+        fields = extract_insight_fields(record, name_map)
         if fields.get("channel") == "phone_call":
             phone_count += 1
         elif fields.get("channel") == "sms_chat":
@@ -1261,7 +1447,12 @@ def get_insight_stats() -> dict[str, Any]:
             resolution_counts[status] = resolution_counts.get(status, 0) + 1
         if fields.get("resolution_key") == "resolved":
             contained_count += 1
-        if fields.get("resolution_key") in {"unresolved", "transferred"} or fields.get("sentiment_label") == "Negative":
+        review = reviews.get(record.get("id")) or default_review(str(record.get("id") or ""))
+        review_counts[review["status"]] = review_counts.get(review["status"], 0) + 1
+        flagged = fields.get("resolution_key") in {"unresolved", "transferred"} or fields.get("sentiment_label") == "Negative"
+        # Triaged conversations (reviewed/ignored) drop off the needs-review KPI;
+        # follow-up always stays on it regardless of resolution/sentiment.
+        if review["status"] == "follow-up" or (flagged and review["status"] == "new"):
             needs_review_count += 1
         latest_received_at = record.get("received_at") or latest_received_at
     total = len(insights) or 1
@@ -1309,12 +1500,21 @@ def get_insight_stats() -> dict[str, Any]:
         "sentiment_bars": sentiment_bars,
         "containment_pct": round(contained_count * 100 / total, 1),
         "needs_review_count": needs_review_count,
+        "review_counts": review_counts,
         "myswitch_group_id": MYSWITCH_INSIGHT_GROUP_ID,
     }
 
 
 def list_insight_summaries(limit: int = 50, q: str = "") -> list[dict[str, Any]]:
-    summaries = [extract_insight_fields(record) for record in read_insights()]
+    name_map = load_assistant_name_map()
+    reviews = list_insight_reviews()
+    summaries = []
+    for record in read_insights():
+        fields = extract_insight_fields(record, name_map)
+        review = reviews.get(fields["id"]) or default_review(fields["id"])
+        fields["review_status"] = review["status"]
+        fields["review_labels"] = review["labels"]
+        summaries.append(fields)
     if q:
         needle = q.lower()
         summaries = [item for item in summaries if needle in json.dumps(item, default=str).lower()]
@@ -1325,7 +1525,7 @@ def list_assistant_rollups() -> list[dict[str, Any]]:
     rollups: dict[str, dict[str, Any]] = {}
     name_map = load_assistant_name_map()
     for record in read_insights():
-        fields = extract_insight_fields(record)
+        fields = extract_insight_fields(record, name_map)
         assistant_id = fields.get("assistant_id") or "unknown"
         entry = rollups.setdefault(
             assistant_id,
@@ -1364,9 +1564,19 @@ def admin_login_page(request: Request) -> HTMLResponse:
 
 @app.post("/admin/login", response_class=HTMLResponse)
 async def admin_login(request: Request):
+    client_ip = _client_ip(request)
+    if login_rate_limited(client_ip):
+        return templates.TemplateResponse(
+            request,
+            "admin_login.html",
+            {"error": "Too many failed attempts. Try again in a few minutes."},
+            status_code=429,
+        )
     fields = await read_form_fields(request)
     if not _secret_matches(fields.get("secret")):
+        record_login_failure(client_ip)
         return templates.TemplateResponse(request, "admin_login.html", {"error": "Invalid shared secret"}, status_code=401)
+    clear_login_failures(client_ip)
     response = RedirectResponse(url="/admin", status_code=303)
     response.set_cookie(
         "admin_session",
@@ -1398,9 +1608,7 @@ def admin_dashboard(request: Request):
 
 @app.get("/admin/api/stats")
 def admin_api_stats(request: Request):
-    redirect = require_admin_response(request)
-    if redirect:
-        return redirect
+    require_admin_api(request)
     return get_insight_stats()
 
 
@@ -1428,18 +1636,14 @@ def admin_assistants_page(request: Request):
 
 @app.get("/admin/api/assistant-names")
 def admin_api_assistant_names(request: Request, refresh: bool = False):
-    redirect = require_admin_response(request)
-    if redirect:
-        return redirect
+    require_admin_api(request)
     names = load_telnyx_assistant_name_map(force=refresh)
     return {"status": _assistant_names_status, "count": len(names), "names": names}
 
 
 @app.get("/admin/api/insights")
 def admin_api_insights(request: Request, q: str = "", limit: int = Query(default=50, ge=1, le=200)):
-    redirect = require_admin_response(request)
-    if redirect:
-        return redirect
+    require_admin_api(request)
     insights = list_insight_summaries(limit=limit, q=q)
     return {"count": len(insights), "insights": insights}
 
@@ -1457,13 +1661,46 @@ def admin_insight_detail_page(request: Request, insight_id: str):
 
 @app.get("/admin/api/insights/{insight_id}")
 def admin_api_insight_detail(request: Request, insight_id: str):
-    redirect = require_admin_response(request)
-    if redirect:
-        return redirect
+    require_admin_api(request)
     record = get_insight_by_id(insight_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Insight not found")
     return record
+
+
+@app.get("/admin/api/reviews")
+def admin_api_reviews(request: Request):
+    require_admin_api(request)
+    reviews = list_insight_reviews()
+    return {"count": len(reviews), "reviews": reviews}
+
+
+@app.get("/admin/api/reviews/{insight_id}")
+def admin_api_review_detail(request: Request, insight_id: str):
+    require_admin_api(request)
+    if get_insight_by_id(insight_id) is None:
+        raise HTTPException(status_code=404, detail="Insight not found")
+    return get_insight_review(insight_id) or default_review(insight_id)
+
+
+@app.put("/admin/api/reviews/{insight_id}")
+async def admin_api_review_upsert(request: Request, insight_id: str):
+    require_admin_api(request)
+    if get_insight_by_id(insight_id) is None:
+        raise HTTPException(status_code=404, detail="Insight not found")
+    payload = await read_json_object(request)
+    status, labels, note = validate_review_payload(payload)
+    if status == "new" and not labels and not note:
+        delete_insight_review(insight_id)
+        return default_review(insight_id)
+    return upsert_insight_review(insight_id, status, labels, note)
+
+
+@app.delete("/admin/api/reviews/{insight_id}")
+def admin_api_review_reset(request: Request, insight_id: str):
+    require_admin_api(request)
+    delete_insight_review(insight_id)
+    return default_review(insight_id)
 
 
 @app.get("/admin/tools/async-jobs", response_class=HTMLResponse)
@@ -1477,9 +1714,7 @@ def admin_async_jobs_page(request: Request, limit: int = Query(default=50, ge=1,
 
 @app.get("/admin/api/async-jobs")
 def admin_api_async_jobs(request: Request, limit: int = Query(default=50, ge=1, le=200)):
-    redirect = require_admin_response(request)
-    if redirect:
-        return redirect
+    require_admin_api(request)
     jobs = list_async_tool_jobs(limit=limit)
     return {"count": len(jobs), "jobs": jobs}
 
@@ -1550,12 +1785,7 @@ async def send_waiver_sms_tool(
     x_webhook_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
     check_secret(x_webhook_secret, request.query_params.get("secret"))
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    payload = await read_json_object(request)
 
     business = str(payload.get("business") or "").strip()
     template = WAIVER_SMS_TEMPLATES.get(business)
@@ -1564,7 +1794,8 @@ async def send_waiver_sms_tool(
 
     from_number = _normalize_phone(payload.get("from"))
     to_number = _normalize_phone(payload.get("to"))
-    result = send_telnyx_sms(from_number=from_number, to_number=to_number, text=template["text"])
+    # urllib is blocking; run it off the event loop so slow Telnyx calls do not stall other requests.
+    result = await asyncio.to_thread(send_telnyx_sms, from_number=from_number, to_number=to_number, text=template["text"])
     message_id = None
     response_data = result.get("response")
     if isinstance(response_data, dict):
@@ -1586,14 +1817,9 @@ async def tripleseat_create_lead_tool(
     x_webhook_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
     check_secret(x_webhook_secret, request.query_params.get("secret"))
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    payload = await read_json_object(request)
     body = build_tripleseat_lead(payload)
-    result = post_tripleseat_resource("lead", body, dry_run=dry_run)
+    result = await asyncio.to_thread(post_tripleseat_resource, "lead", body, dry_run=dry_run)
     return {**result, "tool": "tripleseat-create-lead"}
 
 
@@ -1604,15 +1830,10 @@ async def tripleseat_create_reservation_tool(
     x_webhook_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
     check_secret(x_webhook_secret, request.query_params.get("secret"))
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    payload = await read_json_object(request)
     payload = {**payload, "event_type": payload.get("event_type") or payload.get("reservation_type") or "Reservation"}
     body = build_tripleseat_lead(payload)
-    result = post_tripleseat_resource("lead", body, dry_run=dry_run)
+    result = await asyncio.to_thread(post_tripleseat_resource, "lead", body, dry_run=dry_run)
     return {**result, "tool": "tripleseat-create-reservation"}
 
 
@@ -1623,14 +1844,9 @@ async def tripleseat_create_booking_tool(
     x_webhook_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
     check_secret(x_webhook_secret, request.query_params.get("secret"))
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    payload = await read_json_object(request)
     body = build_tripleseat_booking(payload)
-    result = post_tripleseat_resource("booking", body, dry_run=dry_run)
+    result = await asyncio.to_thread(post_tripleseat_resource, "booking", body, dry_run=dry_run)
     return {**result, "tool": "tripleseat-create-booking"}
 
 
@@ -1645,12 +1861,7 @@ async def receive_async_tool_request(
     check_secret(x_webhook_secret, request.query_params.get("secret"))
     if not x_telnyx_call_control_id:
         raise HTTPException(status_code=400, detail="Missing x-telnyx-call-control-id header")
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    payload = await read_json_object(request)
     started = time.perf_counter()
     job = create_async_tool_job(tool_name=tool_name, call_control_id=x_telnyx_call_control_id, request_body=payload)
     background_tasks.add_task(run_async_tool_job, job["id"])

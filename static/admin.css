@@ -774,6 +774,26 @@ button.full-width { width: 100%; }
   font-family: var(--font-mono);
 }
 
+.review-note-input {
+  width: 100%;
+  margin-top: 2px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-family: var(--font-sans);
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--line-3);
+  border-radius: 8px;
+  resize: vertical;
+}
+
+.review-note-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.review-note.error-text { color: var(--danger); }
+
 .tools-tabs {
   display: flex;
   gap: 8px;

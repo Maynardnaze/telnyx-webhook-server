@@ -88,12 +88,18 @@
   </div>
 
   <div>
-    <section class="panel review-panel" data-review-panel data-insight-id="{{ fields.id }}">
+    <section class="panel review-panel" data-review-panel
+             data-insight-id="{{ fields.id }}"
+             data-review-status="{{ review.status }}"
+             data-review-labels='{{ review.labels|tojson }}'
+             data-review-note="{{ review.note }}">
       <div class="section-label">Review</div>
       <div class="review-grid" data-review-status-grid></div>
       <div class="section-label" style="margin-top:16px; margin-bottom:10px;">Labels</div>
       <div class="label-grid" data-review-label-grid></div>
-      <div class="review-note" data-review-note">persisted locally</div>
+      <div class="section-label" style="margin-top:16px; margin-bottom:10px;">Note</div>
+      <textarea class="review-note-input" data-review-note-input rows="3" placeholder="Triage note…">{{ review.note }}</textarea>
+      <div class="review-note" data-review-note>{% if review.updated_at %}saved · {{ review.updated_at }}{% else %}not reviewed yet{% endif %}</div>
     </section>
 
     <section class="panel">
