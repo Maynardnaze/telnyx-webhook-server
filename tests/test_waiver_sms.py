@@ -72,3 +72,63 @@ def test_send_waiver_sms_rejects_unsupported_business(tmp_path, monkeypatch):
 
     assert response.status_code == 400
     assert "Unsupported waiver business" in response.text
+
+
+def test_sagebrush_menu_sms_uses_fixed_sender_and_suppresses_duplicate(tmp_path, monkeypatch):
+    configure_tmp_paths(tmp_path)
+    sent = []
+
+    def fake_send_telnyx_sms(*, from_number: str, to_number: str, text: str):
+        sent.append({"from": from_number, "to": to_number, "text": text})
+        return {"status_code": 200, "response": {"data": {"id": f"msg_test_{len(sent)}"}}}
+
+    monkeypatch.setattr(webhook_app, "send_telnyx_sms", fake_send_telnyx_sms)
+    monkeypatch.setattr(webhook_app, "SAGEBRUSH_SMS_FROM_NUMBER", "+12487495537")
+    client = TestClient(webhook_app.app)
+    payload = {
+        "from": "telnyxportal@assistant-test.sip.telnyx.com",
+        "to": "248-555-0100",
+        "template": "catering_menu",
+        "call_session_id": "call-session-1",
+    }
+
+    first = client.post(
+        "/telnyx/tools/sagebrush/send-menu-sms",
+        json=payload,
+        headers={"x-webhook-secret": SECRET},
+    )
+    duplicate = client.post(
+        "/telnyx/tools/sagebrush/send-menu-sms",
+        json=payload,
+        headers={"x-webhook-secret": SECRET},
+    )
+
+    assert first.status_code == 200
+    assert duplicate.status_code == 200
+    assert first.json()["sent"] is True
+    assert duplicate.json()["duplicate_suppressed"] is True
+    assert duplicate.json()["message_id"] == "msg_test_1"
+    assert len(sent) == 1
+    assert sent[0]["from"].endswith("7495537")
+    assert sent[0]["to"].endswith("5550100")
+    assert "Sagebrush Cantina catering menu" in sent[0]["text"]
+
+
+def test_sagebrush_menu_sms_accepts_telnyx_bearer(tmp_path, monkeypatch):
+    configure_tmp_paths(tmp_path)
+    webhook_app.TELNYX_API_KEY = "test-telnyx-api-key"
+
+    def fake_send_telnyx_sms(*, from_number: str, to_number: str, text: str):
+        return {"status_code": 200, "response": {"data": {"id": "msg_test_bearer"}}}
+
+    monkeypatch.setattr(webhook_app, "send_telnyx_sms", fake_send_telnyx_sms)
+    client = TestClient(webhook_app.app)
+
+    response = client.post(
+        "/telnyx/tools/sagebrush/send-menu-sms",
+        json={"from": "248-749-5537", "to": "248-555-0100", "template": "regular_menu", "call_session_id": "call-session-2"},
+        headers={"Authorization": "Bearer test-telnyx-api-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message_id"] == "msg_test_bearer"

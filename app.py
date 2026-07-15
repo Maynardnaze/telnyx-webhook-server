@@ -57,6 +57,7 @@ ASSISTANT_MEMORY_INSIGHT_QUERY = os.environ.get("ASSISTANT_MEMORY_INSIGHT_QUERY"
 ASSISTANT_MEMORY_PROFILES = os.environ.get("ASSISTANT_MEMORY_PROFILES", "").strip()
 TELNYX_API_KEY = env_or_file("TELNYX_API_KEY")
 TELNYX_MESSAGES_URL = os.environ.get("TELNYX_MESSAGES_URL", "https://api.telnyx.com/v2/messages")
+SAGEBRUSH_SMS_FROM_NUMBER = os.environ.get("SAGEBRUSH_SMS_FROM_NUMBER", "+12487495537").strip()
 TRIPLESEAT_API_BASE_URL = os.environ.get("TRIPLESEAT_API_BASE_URL", "https://api.tripleseat.com").rstrip("/")
 TRIPLESEAT_PUBLIC_KEY = env_or_file("TRIPLESEAT_PUBLIC_KEY")
 TRIPLESEAT_ACCESS_TOKEN = env_or_file("TRIPLESEAT_ACCESS_TOKEN")
@@ -82,6 +83,17 @@ WAIVER_SMS_TEMPLATES = {
         "display_name": "Urban Air Oxford",
         "url": "https://store.unleashedbrands.com/urban-air/oxford-mi/waiver",
         "text": "Here is the Urban Air Oxford waiver link for your visit to Legacy nine-two-five: https://store.unleashedbrands.com/urban-air/oxford-mi/waiver",
+    },
+}
+
+SAGEBRUSH_MENU_SMS_TEMPLATES = {
+    "catering_menu": {
+        "display_name": "Sagebrush catering menu",
+        "text": "Here is the Sagebrush Cantina catering menu: https://www.mysagebrushcantina.com/Resources/Sagebrush_Catering_Menu_8-16.pdf",
+    },
+    "regular_menu": {
+        "display_name": "Sagebrush regular menu",
+        "text": "Here is the Sagebrush Cantina regular menu: https://mysagebrushcantina.com/Resources/Sagebrush-Cantina-Menu%20copya.pdf",
     },
 }
 
@@ -290,6 +302,20 @@ def has_valid_shared_secret(x_webhook_secret: str | None, query_secret: str | No
     return _secret_matches(x_webhook_secret or query_secret)
 
 
+def has_valid_telnyx_bearer(authorization: str | None) -> bool:
+    """Allow AI webhook tools to authenticate with the existing Telnyx API integration secret."""
+    if not TELNYX_API_KEY or not authorization:
+        return False
+    scheme, _, token = authorization.partition(" ")
+    return scheme.lower() == "bearer" and hmac.compare_digest(token.strip(), TELNYX_API_KEY)
+
+
+def check_tool_auth(x_webhook_secret: str | None, query_secret: str | None = None, authorization: str | None = None) -> None:
+    if has_valid_shared_secret(x_webhook_secret, query_secret) or has_valid_telnyx_bearer(authorization):
+        return
+    raise HTTPException(status_code=401, detail="Missing or invalid webhook secret or bearer token")
+
+
 def _normalize_phone(value: Any) -> str:
     """Strict variant of normalize_phone for outbound SMS: E.164 or reject."""
     phone = normalize_phone(value)
@@ -324,6 +350,163 @@ def send_telnyx_sms(*, from_number: str, to_number: str, text: str) -> dict[str,
         raise HTTPException(status_code=502, detail=f"Telnyx Messages API error {exc.code}: {detail[:500]}") from exc
     except URLError as exc:
         raise HTTPException(status_code=502, detail=f"Telnyx Messages API request failed: {exc.reason}") from exc
+
+
+def _sms_message_id(result: dict[str, Any]) -> str | None:
+    response_data = result.get("response")
+    if isinstance(response_data, dict):
+        data = response_data.get("data")
+        if isinstance(data, dict):
+            return data.get("id")
+        return response_data.get("id")
+    return None
+
+
+def _is_e164_phone(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"\+[1-9]\d{7,14}", value.strip()))
+
+
+def _extract_menu_template_name(payload: dict[str, Any]) -> str:
+    requested = str(payload.get("template") or payload.get("template_name") or "").strip()
+    if requested in SAGEBRUSH_MENU_SMS_TEMPLATES:
+        return requested
+    text = str(payload.get("text") or "").strip()
+    for name, template in SAGEBRUSH_MENU_SMS_TEMPLATES.items():
+        if text == template["text"]:
+            return name
+    raise HTTPException(status_code=400, detail="Unsupported Sagebrush menu SMS template")
+
+
+def _sms_idempotency_scope(payload: dict[str, Any], *, from_number: str, to_number: str, template_name: str) -> str:
+    scope = first_present(
+        payload.get("idempotency_key"),
+        payload.get("call_session_id"),
+        payload.get("call_control_id"),
+        payload.get("conversation_id"),
+        payload.get("telnyx_call_session_id"),
+        payload.get("telnyx_conversation_id"),
+    )
+    if scope:
+        return str(scope).strip()
+    # Telnyx Assistant webhook tools do not always expose a stable call/conversation
+    # variable. Fall back to an hourly sender/destination/template bucket so model
+    # retries and transcript loops in one call cannot create duplicate menu texts,
+    # without suppressing later callers indefinitely.
+    hour_bucket = datetime.now(timezone.utc).strftime("%Y%m%dT%H")
+    return f"fallback-hour:{hour_bucket}:{from_number}:{to_number}:{template_name}"
+
+
+def _build_sms_idempotency_key(scope: str, to_number: str, template_name: str) -> str:
+    digest = hashlib.sha256(f"{scope}|{to_number}|{template_name}".encode("utf-8")).hexdigest()
+    return f"sagebrush-menu:{digest}"
+
+
+def get_sms_idempotency_record(idempotency_key: str) -> dict[str, Any] | None:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            row = conn.execute("SELECT * FROM sms_idempotency_keys WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    response_data = None
+    try:
+        response_data = json.loads(row["response_data"]) if row["response_data"] else None
+    except json.JSONDecodeError:
+        response_data = row["response_data"]
+    return {
+        "idempotency_key": row["idempotency_key"],
+        "template_name": row["template_name"],
+        "to_number": row["to_number"],
+        "from_number": row["from_number"],
+        "message_id": row["message_id"],
+        "created_at": row["created_at"],
+        "response_data": response_data,
+    }
+
+
+def save_sms_idempotency_record(
+    *,
+    idempotency_key: str,
+    template_name: str,
+    to_number: str,
+    from_number: str,
+    message_id: str | None,
+    request_data: dict[str, Any],
+    response_data: dict[str, Any],
+) -> None:
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sms_idempotency_keys
+                (idempotency_key, template_name, to_number, from_number, message_id, request_data, response_data, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    idempotency_key,
+                    template_name,
+                    to_number,
+                    from_number,
+                    message_id,
+                    json.dumps(request_data, separators=(",", ":"), default=str),
+                    json.dumps(response_data, separators=(",", ":"), default=str),
+                    utc_now(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def send_sagebrush_menu_sms_once(payload: dict[str, Any]) -> dict[str, Any]:
+    template_name = _extract_menu_template_name(payload)
+    template = SAGEBRUSH_MENU_SMS_TEMPLATES[template_name]
+    to_number = _normalize_phone(payload.get("to") or payload.get("phone") or payload.get("telnyx_end_user_target"))
+    requested_from = str(payload.get("from") or "").strip()
+    if _is_e164_phone(requested_from):
+        from_number = _normalize_phone(requested_from)
+    else:
+        from_number = _normalize_phone(SAGEBRUSH_SMS_FROM_NUMBER)
+    scope = _sms_idempotency_scope(payload, from_number=from_number, to_number=to_number, template_name=template_name)
+    idempotency_key = _build_sms_idempotency_key(scope, to_number, template_name)
+    duplicate = get_sms_idempotency_record(idempotency_key)
+    if duplicate:
+        return {
+            "ok": True,
+            "sent": False,
+            "duplicate_suppressed": True,
+            "template": template_name,
+            "display_name": template["display_name"],
+            "sent_to": to_number,
+            "from": from_number,
+            "message_id": duplicate.get("message_id"),
+            "message": f"{template['display_name']} was already sent during this call. Duplicate suppressed.",
+        }
+    result = send_telnyx_sms(from_number=from_number, to_number=to_number, text=template["text"])
+    message_id = _sms_message_id(result)
+    save_sms_idempotency_record(
+        idempotency_key=idempotency_key,
+        template_name=template_name,
+        to_number=to_number,
+        from_number=from_number,
+        message_id=message_id,
+        request_data=payload,
+        response_data=result,
+    )
+    return {
+        "ok": True,
+        "sent": True,
+        "duplicate_suppressed": False,
+        "template": template_name,
+        "display_name": template["display_name"],
+        "sent_to": to_number,
+        "from": from_number,
+        "message_id": message_id,
+        "message": f"Sent {template['display_name']} by SMS.",
+    }
 
 
 def _clean_str(value: Any) -> str | None:
@@ -545,6 +728,18 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_async_tool_jobs_received_at ON async_tool_jobs(received_at);
                 CREATE INDEX IF NOT EXISTS idx_async_tool_jobs_status ON async_tool_jobs(status);
+
+                CREATE TABLE IF NOT EXISTS sms_idempotency_keys (
+                    idempotency_key TEXT PRIMARY KEY,
+                    template_name TEXT NOT NULL,
+                    to_number TEXT NOT NULL,
+                    from_number TEXT NOT NULL,
+                    message_id TEXT,
+                    request_data TEXT NOT NULL,
+                    response_data TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_sms_idempotency_created_at ON sms_idempotency_keys(created_at);
                 """
             )
             conn.commit()
@@ -1777,6 +1972,22 @@ async def admin_webhook_simulator_submit(request: Request):
         return render_admin(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": json_pretty(result), "error": None, "active_page": "simulator"})
     except Exception as exc:
         return render_admin(request, "admin_webhook_simulator.html", {"payload": payload_text, "result": None, "error": str(exc), "active_page": "simulator"}, status_code=400)
+
+
+@app.post("/telnyx/tools/sagebrush/send-menu-sms")
+async def sagebrush_send_menu_sms_tool(
+    request: Request,
+    x_webhook_secret: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    check_tool_auth(x_webhook_secret, request.query_params.get("secret"), authorization)
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Expected JSON payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected top-level JSON object")
+    return send_sagebrush_menu_sms_once(payload)
 
 
 @app.post("/telnyx/tools/send-waiver-sms")

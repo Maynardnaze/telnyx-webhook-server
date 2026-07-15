@@ -141,6 +141,7 @@ Runtime configuration is managed in Doppler. Do not keep long-lived `.env` files
 | `WEBHOOK_SECRET` | Yes | Shared secret for admin login and protected endpoints |
 | `TELNYX_PUBLIC_KEY` | Production: yes | Telnyx Ed25519 public key for `/telnyx/insights` signature verification |
 | `TELNYX_API_KEY` | Feature-dependent | Telnyx REST API key for assistant names, Add Messages, and SMS helpers |
+| `SAGEBRUSH_SMS_FROM_NUMBER` | No | Fixed SMS-capable sender for Sagebrush menu SMS wrapper; defaults to the Sagebrush DID |
 | `TRIPLESEAT_PUBLIC_KEY` | Feature-dependent | Tripleseat public lead-form API key for creating leads from assistant tools |
 | `TRIPLESEAT_ACCESS_TOKEN` | Feature-dependent | Tripleseat OAuth bearer token for booking/event API calls when enabled |
 | `TRIPLESEAT_DRY_RUN` | No | Defaults to `1`; set to `0` only after Tripleseat credentials and field mapping are verified |
@@ -220,6 +221,7 @@ To force a fresh import:
 | `POST /telnyx/insights` | Yes | Telnyx Ed25519 signature **or** shared secret |
 | `GET /telnyx/insights` | Yes | Shared secret header or `?secret=` query param |
 | `POST /telnyx/tools/async/{tool_name}` | Yes | Shared secret header or `?secret=` query param, plus `x-telnyx-call-control-id` |
+| `POST /telnyx/tools/sagebrush/send-menu-sms` | Yes | Shared secret header/query param or `Authorization: Bearer <TELNYX_API_KEY>` from Telnyx integration secret |
 | `POST /telnyx/tools/tripleseat/create-lead` | Yes | Shared secret header or `?secret=` query param |
 | `POST /telnyx/tools/tripleseat/create-reservation` | Yes | Shared secret header or `?secret=` query param |
 | `POST /telnyx/tools/tripleseat/create-booking` | Yes | Shared secret header or `?secret=` query param |
