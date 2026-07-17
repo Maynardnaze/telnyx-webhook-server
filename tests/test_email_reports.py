@@ -222,3 +222,81 @@ def test_assistant_cost_for_window_prorates_monthly_cost():
     assert webhook_app.assistant_cost_for_window(model, hours=730, assistant_count=1) == 95.0
     assert webhook_app.assistant_cost_for_window(model, hours=24, assistant_count=2) == 95.0 * 2 * (24 / 730.0)
     assert webhook_app.assistant_cost_for_window({"monthly_assistant_cost": "bad"}, hours=24, assistant_count=1) > 0
+
+
+def test_classify_opportunity_flags_captured_and_at_risk_leads():
+    captured = webhook_app.classify_opportunity(
+        {"primary_category": "Appointment", "resolution_key": "resolved", "sentiment_label": "Positive"},
+        "Caller scheduled an appointment for next week.",
+    )
+    assert captured["is_lead"] is True
+    assert captured["is_captured"] is True
+    assert captured["is_at_risk"] is False
+    assert captured["outcome_label"] == "captured"
+
+    unresolved = webhook_app.classify_opportunity(
+        {"primary_category": "Quote Request", "resolution_key": "unresolved"},
+        "Caller requested a quote but the call was unresolved.",
+    )
+    assert unresolved["is_lead"] is True
+    assert unresolved["is_at_risk"] is True
+    assert "unresolved call" in unresolved["risk_reasons"]
+
+    negative = webhook_app.classify_opportunity(
+        {"primary_category": "Catering Lead", "resolution_key": "partial", "sentiment_label": "Negative"},
+        "Caller asked about catering pricing and needs a callback.",
+    )
+    assert negative["is_lead"] is True
+    assert negative["is_at_risk"] is True
+    assert "negative sentiment" in negative["risk_reasons"]
+    assert "callback needed" in negative["risk_reasons"]
+
+    faq = webhook_app.classify_opportunity(
+        {"primary_category": "FAQ", "resolution_key": "resolved", "sentiment_label": "Neutral"},
+        "Caller asked for today's hours and parking information.",
+    )
+    assert faq["is_lead"] is False
+    assert faq["is_captured"] is False
+    assert faq["is_at_risk"] is False
+    assert faq["outcome_label"] == "general"
+
+
+def test_estimate_row_revenue_uses_category_overrides():
+    model = {
+        "default_job_value": 500.0,
+        "default_lead_probability": 0.25,
+        "missed_without_ai_probability": 0.60,
+        "monthly_assistant_cost": 95.0,
+        "category_values": {"Catering Lead": "2000"},
+        "category_probabilities": {"Catering Lead": "0.5"},
+        "assistant_overrides": {},
+    }
+
+    captured_revenue = webhook_app.estimate_row_revenue(
+        {"primary_category": "Catering Lead", "assistant_id": "assistant-a"},
+        {"is_lead": True, "is_captured": True, "is_at_risk": False},
+        model,
+    )
+    assert captured_revenue["job_value"] == 2000.0
+    assert captured_revenue["lead_probability"] == 0.5
+    assert captured_revenue["opportunity_value"] == 1000.0
+    assert captured_revenue["avoided_lost_revenue"] == 600.0
+    assert captured_revenue["remaining_lost_revenue"] == 0.0
+
+    at_risk_revenue = webhook_app.estimate_row_revenue(
+        {"primary_category": "Unknown", "assistant_id": "assistant-a"},
+        {"is_lead": True, "is_captured": False, "is_at_risk": True},
+        model,
+    )
+    assert at_risk_revenue["opportunity_value"] == 125.0
+    assert at_risk_revenue["avoided_lost_revenue"] == 0.0
+    assert at_risk_revenue["remaining_lost_revenue"] == 125.0
+
+    non_lead_revenue = webhook_app.estimate_row_revenue(
+        {"primary_category": "FAQ", "assistant_id": "assistant-a"},
+        {"is_lead": False, "is_captured": False, "is_at_risk": False},
+        model,
+    )
+    assert non_lead_revenue["opportunity_value"] == 0.0
+    assert non_lead_revenue["avoided_lost_revenue"] == 0.0
+    assert non_lead_revenue["remaining_lost_revenue"] == 0.0

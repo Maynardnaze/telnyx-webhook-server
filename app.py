@@ -185,6 +185,119 @@ def assistant_cost_for_window(model: dict[str, Any], hours: int, assistant_count
     monthly = _safe_float(model.get("monthly_assistant_cost"), DEFAULT_REVENUE_MODEL["monthly_assistant_cost"])
     return monthly * max(1, assistant_count) * (max(1, hours) / 730.0)
 
+
+LEAD_TERMS = (
+    "lead",
+    "quote",
+    "estimate",
+    "booking",
+    "appointment",
+    "reservation",
+    "event",
+    "catering",
+    "private",
+    "new customer",
+    "sales",
+    "pricing",
+)
+RISK_TERMS = (
+    "missed",
+    "hung up",
+    "no answer",
+    "failed transfer",
+    "could not",
+    "didn't answer",
+    "did not answer",
+    "needs callback",
+    "need callback",
+    "callback needed",
+    "call back",
+    "follow up",
+    "follow-up",
+)
+CAPTURE_TERMS = ("appointment", "booking", "reservation", "scheduled", "message taken", "collected")
+
+
+def classify_opportunity(fields: dict[str, Any], summary: str) -> dict[str, Any]:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            fields.get("primary_category"),
+            fields.get("intent_name"),
+            fields.get("resolution_status"),
+            summary,
+        )
+    ).lower()
+    resolution_key = str(fields.get("resolution_key") or "").lower()
+    sentiment_label = str(fields.get("sentiment_label") or "").lower()
+    is_lead = bool(fields.get("lead_like")) or any(term in text for term in LEAD_TERMS)
+
+    risk_reasons: list[str] = []
+    if resolution_key == "unresolved":
+        risk_reasons.append("unresolved call")
+    if sentiment_label == "negative":
+        risk_reasons.append("negative sentiment")
+    if any(term in text for term in ("callback", "call back", "follow up", "follow-up")) or fields.get("callback_needed"):
+        risk_reasons.append("callback needed")
+    if any(term in text for term in ("no answer", "failed transfer", "didn't answer", "did not answer")):
+        risk_reasons.append("transfer/no-answer risk")
+    elif any(term in text for term in RISK_TERMS) and not risk_reasons:
+        risk_reasons.append("follow-up risk")
+
+    is_captured = is_lead and (
+        resolution_key == "resolved"
+        or bool(fields.get("callback_needed"))
+        or int(fields.get("transfer") or 0) > 0
+        or any(term in text for term in CAPTURE_TERMS)
+    )
+    is_at_risk = is_lead and bool(risk_reasons)
+    if is_at_risk:
+        outcome_label = "at risk"
+    elif is_captured:
+        outcome_label = "captured"
+    elif is_lead:
+        outcome_label = "lead"
+    else:
+        outcome_label = "general"
+    return {
+        "is_lead": is_lead,
+        "is_captured": is_captured,
+        "is_at_risk": is_at_risk,
+        "risk_reasons": risk_reasons,
+        "outcome_label": outcome_label,
+    }
+
+
+def estimate_row_revenue(fields: dict[str, Any], opportunity: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
+    category = str(fields.get("primary_category") or "").strip()
+    assistant_id = str(fields.get("assistant_id") or "")
+    assistant_overrides = model.get("assistant_overrides") or {}
+    raw_override = assistant_overrides.get(assistant_id) if isinstance(assistant_overrides, dict) else None
+    override = raw_override if isinstance(raw_override, dict) else {}
+    active_model = {**model, **override}
+    category_values = active_model.get("category_values") or {}
+    category_probabilities = active_model.get("category_probabilities") or {}
+    value = _safe_float(category_values.get(category), _safe_float(active_model.get("default_job_value"), 500.0))
+    probability = min(
+        _safe_float(category_probabilities.get(category), _safe_float(active_model.get("default_lead_probability"), 0.25)),
+        1.0,
+    )
+    opportunity_value = value * probability if opportunity.get("is_lead") else 0.0
+    avoided_lost_revenue = (
+        opportunity_value * _safe_float(active_model.get("missed_without_ai_probability"), 0.60)
+        if opportunity.get("is_captured")
+        else 0.0
+    )
+    remaining_lost_revenue = opportunity_value if opportunity.get("is_at_risk") else 0.0
+    return {
+        "job_value": value,
+        "lead_probability": probability,
+        "opportunity_value": opportunity_value,
+        "avoided_lost_revenue": avoided_lost_revenue,
+        "remaining_lost_revenue": remaining_lost_revenue,
+        "revenue_model_category": category or "default",
+    }
+
 app = FastAPI(
     title="Miswitch Telnyx Webhook Server",
     version="0.3.0",
