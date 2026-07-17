@@ -206,8 +206,64 @@ function initAssistantNameLoader() {
   load();
 }
 
+function initEmailReportBuilder() {
+  const root = document.querySelector('[data-email-report-builder]');
+  if (!root) return;
+  const status = root.querySelector('[data-email-report-status]');
+  const output = document.querySelector('[data-email-report-preview-output]');
+  const previewBtn = root.querySelector('[data-email-report-preview]');
+  const sendBtn = root.querySelector('[data-email-report-send]');
+  const selectedPayload = () => ({
+    assistant_ids: Array.from(root.querySelectorAll('input[name="assistant_ids"]:checked')).map((el) => el.value),
+    hours: Number(root.querySelector('[name="hours"]')?.value || 24),
+    recipient: root.querySelector('[name="recipient"]')?.value || '',
+  });
+  const setStatus = (text, isError = false) => {
+    if (!status) return;
+    status.textContent = text;
+    status.classList.toggle('error-text', isError);
+  };
+  const requestReport = async (endpoint) => {
+    const payload = selectedPayload();
+    if (!payload.assistant_ids.length) throw new Error('Select at least one assistant');
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    return data;
+  };
+  const preview = async () => {
+    setStatus('building preview…');
+    try {
+      const data = await requestReport('/admin/api/email-report/preview');
+      if (output) output.textContent = data.markdown || '';
+      setStatus(`preview: ${data.count} conversation${data.count === 1 ? '' : 's'}, ${data.duplicate_sms_flags} SMS flag${data.duplicate_sms_flags === 1 ? '' : 's'}`);
+    } catch (err) {
+      setStatus(`preview failed: ${err.message || err}`, true);
+    }
+  };
+  previewBtn?.addEventListener('click', preview);
+  sendBtn?.addEventListener('click', async () => {
+    setStatus('sending email…');
+    try {
+      const data = await requestReport('/admin/api/email-report/send');
+      setStatus(`sent to ${data.recipient}`);
+    } catch (err) {
+      setStatus(`send failed: ${err.message || err}`, true);
+    }
+  });
+  root.querySelectorAll('input[name="assistant_ids"], [name="hours"], [name="recipient"]').forEach((el) => {
+    el.addEventListener('change', preview);
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   initReviewPanel();
   initClientFilter();
   initAssistantNameLoader();
+  initEmailReportBuilder();
 });

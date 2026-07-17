@@ -36,6 +36,10 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="11" rx="2"></rect><path d="M12 8V4M8 14h.01M16 14h.01"></path></svg>
           Assistants
         </a>
+        <a class="nav-link{% if active_page == 'email-report' %} active{% endif %}" href="/admin/reports/email">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"></path><path d="m4 7 8 6 8-6"></path></svg>
+          Email Reports
+        </a>
 
         <div class="nav-label">Operate</div>
         <a class="nav-link{% if active_page == 'assistant-init' %} active{% endif %}" href="/admin/tools/assistant-init">

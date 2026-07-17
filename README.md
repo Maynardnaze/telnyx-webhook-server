@@ -125,6 +125,8 @@ The first admin frontend is intentionally simple and served by FastAPI from the 
 | `/admin/insights` | Conversation list with channel, sentiment, and intent badges |
 | `/admin/insights/{id}` | Detail view with all five MySwitch insight cards plus raw JSON |
 | `/admin/insights/{id}` (Review panel) | Set review status/labels/note — persisted server-side in SQLite |
+| `/admin/assistants` | Assistant rollup grouped by `assistant_id`, with live Telnyx assistant names when `TELNYX_API_KEY` is configured |
+| `/admin/reports/email` | Build/preview/send a multi-assistant AI insights email report using `SMTP_*` credentials |
 | `/admin/tools/assistant-init` | Test the local Dynamic Variables Webhook response builder |
 | `/admin/tools/async-jobs` | Review dry-run async tool jobs and prepared Add Messages payloads |
 | `/admin/tools/webhook-simulator` | Store a sample insight payload without calling external APIs |
@@ -157,6 +159,14 @@ Runtime configuration is managed in Doppler. Do not keep long-lived `.env` files
 | `ASSISTANT_MEMORY_PROFILES` | No | Optional per-assistant profile JSON |
 | `ASSISTANT_NAMES_REFRESH_SECONDS` | No | Telnyx assistant-name cache TTL; default `900` |
 | `ASSISTANT_NAMES_FAILURE_RETRY_SECONDS` | No | Backoff before retrying a failed Telnyx assistant-name lookup; default `60` |
+| `SMTP_HOST` | Email reports | SMTP host, e.g. `smtp.office365.com` |
+| `SMTP_PORT` | Email reports | SMTP port; defaults to `587` |
+| `SMTP_USERNAME` | Email reports | Authenticated SMTP username/sender account |
+| `SMTP_PASSWORD` | Email reports | Authenticated SMTP password or app password |
+| `SMTP_FROM` | Email reports | Sender address shown on report emails; defaults to `SMTP_USERNAME` |
+| `SMTP_STARTTLS` | Email reports | StartTLS flag; defaults to enabled |
+| `SMTP_USE_SSL` | Email reports | Use implicit SSL instead of StartTLS; defaults to disabled |
+| `REPORT_EMAIL_TO` | Email reports | Default recipient prefilled in the admin email-report page |
 | `ADMIN_LOGIN_MAX_FAILURES` | No | Failed admin logins allowed per IP before lockout; default `5` |
 | `ADMIN_LOGIN_FAILURE_WINDOW_SECONDS` | No | Sliding window for the login lockout; default `900` |
 

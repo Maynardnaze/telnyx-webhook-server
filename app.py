@@ -8,11 +8,14 @@ import hmac
 import json
 import os
 import re
+import smtplib
 import sqlite3
+import ssl
 import time
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 from urllib import request as urlrequest
@@ -99,6 +102,8 @@ SAGEBRUSH_MENU_SMS_TEMPLATES = {
 
 ASSISTANT_NAMES_PATH = Path(os.environ.get("ASSISTANT_NAMES_PATH", "/data/assistant-names.json"))
 ASSISTANT_NAMES_JSON = os.environ.get("ASSISTANT_NAMES", "").strip()
+REVENUE_MODEL_JSON = os.environ.get("REVENUE_MODEL", "").strip()
+REVENUE_MODEL_PATH = Path(os.environ.get("REVENUE_MODEL_PATH", "/data/revenue-model.json"))
 ASSISTANT_NAMES_REFRESH_SECONDS = int(os.environ.get("ASSISTANT_NAMES_REFRESH_SECONDS", "900"))
 ASSISTANT_NAMES_FAILURE_RETRY_SECONDS = int(os.environ.get("ASSISTANT_NAMES_FAILURE_RETRY_SECONDS", "60"))
 ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS = os.environ.get("ALLOW_LOCAL_ASSISTANT_NAME_FALLBACKS") == "1"
@@ -116,6 +121,69 @@ MYSWITCH_INSIGHT_DEFINITIONS: list[dict[str, Any]] = [
     {"id": "e0398bdc-55c1-4a32-a430-1bd3b625afb2", "key": "resolution_status", "name": "Call Resolution Status", "order": 4},
     {"id": "cfcc865c-d3d4-4823-8a4b-f0df57d9f56f", "key": "summary", "name": "Summary", "order": 5},
 ]
+
+DEFAULT_REVENUE_MODEL = {
+    "default_job_value": 500.0,
+    "default_lead_probability": 0.25,
+    "missed_without_ai_probability": 0.60,
+    "monthly_assistant_cost": 95.0,
+    "category_values": {},
+    "category_probabilities": {},
+    "assistant_overrides": {},
+}
+
+
+def _safe_float(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed >= 0 else fallback
+
+
+def load_revenue_model() -> dict[str, Any]:
+    model = dict(DEFAULT_REVENUE_MODEL)
+    parsed = None
+    if REVENUE_MODEL_JSON:
+        try:
+            parsed = json.loads(REVENUE_MODEL_JSON)
+        except json.JSONDecodeError:
+            parsed = None
+    elif REVENUE_MODEL_PATH.exists():
+        try:
+            parsed = json.loads(REVENUE_MODEL_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            parsed = None
+    if isinstance(parsed, dict):
+        model.update(parsed)
+    model["default_job_value"] = _safe_float(model.get("default_job_value"), DEFAULT_REVENUE_MODEL["default_job_value"])
+    model["default_lead_probability"] = min(
+        _safe_float(model.get("default_lead_probability"), DEFAULT_REVENUE_MODEL["default_lead_probability"]),
+        1.0,
+    )
+    model["missed_without_ai_probability"] = min(
+        _safe_float(model.get("missed_without_ai_probability"), DEFAULT_REVENUE_MODEL["missed_without_ai_probability"]),
+        1.0,
+    )
+    model["monthly_assistant_cost"] = _safe_float(
+        model.get("monthly_assistant_cost"), DEFAULT_REVENUE_MODEL["monthly_assistant_cost"]
+    )
+    if not isinstance(model.get("category_values"), dict):
+        model["category_values"] = {}
+    if not isinstance(model.get("category_probabilities"), dict):
+        model["category_probabilities"] = {}
+    if not isinstance(model.get("assistant_overrides"), dict):
+        model["assistant_overrides"] = {}
+    return model
+
+
+def money(value: float) -> str:
+    return "${:,.0f}".format(float(value or 0))
+
+
+def assistant_cost_for_window(model: dict[str, Any], hours: int, assistant_count: int = 1) -> float:
+    monthly = _safe_float(model.get("monthly_assistant_cost"), DEFAULT_REVENUE_MODEL["monthly_assistant_cost"])
+    return monthly * max(1, assistant_count) * (max(1, hours) / 730.0)
 
 app = FastAPI(
     title="Miswitch Telnyx Webhook Server",
@@ -1744,6 +1812,173 @@ def list_assistant_rollups() -> list[dict[str, Any]]:
     return sorted(rollups.values(), key=lambda item: item["count"], reverse=True)
 
 
+def list_report_assistant_options() -> list[dict[str, Any]]:
+    """Return selectable assistants from stored insights plus live/local Telnyx names."""
+    rollups = {item["assistant_id"]: item for item in list_assistant_rollups()}
+    name_map = load_assistant_name_map()
+    for assistant_id, assistant_name in name_map.items():
+        rollups.setdefault(
+            assistant_id,
+            {
+                "assistant_id": assistant_id,
+                "assistant_name": assistant_name,
+                "assistant_short": (assistant_id[:18] + "…") if len(assistant_id) > 19 else assistant_id,
+                "count": 0,
+                "phone_count": 0,
+                "sms_count": 0,
+                "resolved_count": 0,
+            },
+        )
+    return sorted(rollups.values(), key=lambda item: (item.get("count", 0), item.get("assistant_name") or ""), reverse=True)
+
+
+def _parse_received_at(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _tool_counts(fields: dict[str, Any]) -> dict[str, int]:
+    counts = {"catering_sms": 0, "regular_sms": 0, "callback_sms": 0, "transfer": 0}
+    for item in fields.get("called_tools") or []:
+        name = str(item)
+        if name == "send_catering_menu_sms":
+            counts["catering_sms"] += 1
+        elif name == "send_regular_menu_sms":
+            counts["regular_sms"] += 1
+        elif name == "send_catering_callback_sms":
+            counts["callback_sms"] += 1
+        elif name == "transfer" or name.endswith("transfer"):
+            counts["transfer"] += 1
+    return counts
+
+
+def build_email_report(assistant_ids: list[str], hours: int = 24, recipient: str | None = None) -> dict[str, Any]:
+    selected = {str(item).strip() for item in assistant_ids if str(item).strip()}
+    if not selected:
+        raise HTTPException(status_code=400, detail="Select at least one assistant")
+    hours = max(1, min(int(hours or 24), 24 * 31))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    name_map = load_assistant_name_map()
+    rows: list[dict[str, Any]] = []
+    for record in read_insights():
+        fields = extract_insight_fields(record, name_map)
+        assistant_id = fields.get("assistant_id") or "unknown"
+        if assistant_id not in selected:
+            continue
+        received_dt = _parse_received_at(fields.get("received_at"))
+        if received_dt and received_dt < cutoff:
+            continue
+        counts = _tool_counts(fields)
+        summary = str(fields.get("summary_text") or fields.get("summary") or "No summary yet")
+        combined = json.dumps(fields, default=str).lower()
+        callback_needed = any(term in combined for term in ["callback", "call back", "follow up", "follow-up"])
+        lead_like = any(term in combined for term in ["lead", "catering", "event", "private", "booking", "quote", "callback"])
+        rows.append({**fields, **counts, "callback_needed": callback_needed, "lead_like": lead_like, "duplicate_sms": counts["catering_sms"] > 1 or counts["regular_sms"] > 1, "summary_text": summary})
+    rows.sort(key=lambda item: item.get("received_at") or "", reverse=True)
+    total = len(rows)
+    lead_count = sum(1 for item in rows if item["lead_like"])
+    callback_count = sum(1 for item in rows if item["callback_needed"])
+    duplicate_count = sum(1 for item in rows if item["duplicate_sms"])
+    subject = f"AI Insights Report — {total} conversations, {lead_count} leads, {callback_count} callbacks"
+    assistant_names = [assistant_name_for(aid, name_map) for aid in sorted(selected)]
+    lines = [
+        f"## AI Insights Report",
+        "",
+        f"Window: last {hours} hours",
+        f"Assistants: {', '.join(assistant_names)}",
+        f"Recipient: {recipient or env_or_file('REPORT_EMAIL_TO', '') or 'not set'}",
+        "",
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| Total conversations | {total} |",
+        f"| Lead-like conversations | {lead_count} |",
+        f"| Callback/follow-up needed | {callback_count} |",
+        f"| Catering menu SMS tool calls | {sum(item['catering_sms'] for item in rows)} |",
+        f"| Regular menu SMS tool calls | {sum(item['regular_sms'] for item in rows)} |",
+        f"| Transfer tool calls | {sum(item['transfer'] for item in rows)} |",
+        f"| Duplicate SMS QA flags | {duplicate_count} |",
+        "",
+        "## Callback-needed list",
+    ]
+    callbacks = [item for item in rows if item["callback_needed"]]
+    if callbacks:
+        lines.extend(["| Time | Assistant | Caller | Summary |", "|---|---|---|---|"])
+        for item in callbacks[:25]:
+            safe_summary = str(item["summary_text"]).replace("|", "\\|")[:220]
+            lines.append(f"| {item.get('received_at_display') or item.get('received_at') or '—'} | {item.get('assistant_name') or '—'} | {item.get('caller') or '—'} | {safe_summary} |")
+    else:
+        lines.append("No callback-needed conversations found.")
+    lines.extend(["", "## SMS / tool-call QA flags"])
+    flagged = [item for item in rows if item["duplicate_sms"]]
+    if flagged:
+        lines.extend(["| Time | Assistant | Caller | Catering SMS | Regular SMS | Conversation |", "|---|---|---|---:|---:|---|"])
+        for item in flagged[:25]:
+            lines.append(f"| {item.get('received_at_display') or item.get('received_at') or '—'} | {item.get('assistant_name') or '—'} | {item.get('caller') or '—'} | {item['catering_sms']} | {item['regular_sms']} | `{item.get('conversation_id') or item.get('id')}` |")
+    else:
+        lines.append("No duplicate menu-SMS tool calls detected.")
+    lines.extend(["", "## Lead summaries"])
+    if rows:
+        for item in rows[:40]:
+            flags = []
+            if item["lead_like"]:
+                flags.append("lead")
+            if item["callback_needed"]:
+                flags.append("callback")
+            if item["duplicate_sms"]:
+                flags.append("DUPLICATE_SMS")
+            lines.append(f"- **{item.get('received_at_display') or item.get('received_at') or '—'}** — {item.get('assistant_name') or item.get('assistant_id')} — {item.get('caller') or 'Unknown caller'} — `{', '.join(flags) if flags else 'general'}`")
+            lines.append(f"  - {item['summary_text']}")
+            lines.append(f"  - Tools: catering_sms={item['catering_sms']}, regular_sms={item['regular_sms']}, callback_sms={item['callback_sms']}, transfers={item['transfer']} | conversation `{item.get('conversation_id') or item.get('id')}`")
+    else:
+        lines.append("No conversations found for the selected assistants and time window.")
+    markdown = "\n".join(lines)
+    return {"subject": subject, "markdown": markdown, "count": total, "lead_count": lead_count, "callback_count": callback_count, "duplicate_sms_flags": duplicate_count, "assistant_ids": sorted(selected), "recipient": recipient}
+
+
+def markdown_to_simple_html(markdown: str) -> str:
+    escaped = markdown.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    escaped = re.sub(r"^## (.*)$", r"<h2>\1</h2>", escaped, flags=re.MULTILINE)
+    return "<html><body style='font-family:Arial,sans-serif;line-height:1.45'>" + escaped.replace("\n", "<br>\n") + "</body></html>"
+
+
+def send_email_report(report: dict[str, Any], recipient: str) -> dict[str, Any]:
+    host = env_or_file("SMTP_HOST")
+    username = env_or_file("SMTP_USERNAME")
+    password = env_or_file("SMTP_PASSWORD")
+    sender = env_or_file("SMTP_FROM") or username
+    port = int(env_or_file("SMTP_PORT", "587") or "587")
+    if not (host and username and password and sender):
+        raise HTTPException(status_code=400, detail="SMTP is not configured: set SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM")
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg["Subject"] = report["subject"]
+    msg.set_content(report["markdown"])
+    msg.add_alternative(markdown_to_simple_html(report["markdown"]), subtype="html")
+    use_ssl = str(env_or_file("SMTP_USE_SSL", "false")).lower() in {"1", "true", "yes"}
+    starttls = str(env_or_file("SMTP_STARTTLS", "true")).lower() not in {"0", "false", "no"}
+    if use_ssl:
+        with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=60) as smtp:
+            smtp.login(username, password)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=60) as smtp:
+            smtp.ehlo()
+            if starttls:
+                smtp.starttls(context=ssl.create_default_context())
+                smtp.ehlo()
+            smtp.login(username, password)
+            smtp.send_message(msg)
+    return {"ok": True, "recipient": recipient, "subject": report["subject"], "count": report["count"]}
+
+
 init_db()
 
 
@@ -1827,6 +2062,48 @@ def admin_assistants_page(request: Request):
         "admin_assistants.html",
         {"assistants": assistants, "assistant_name_status": _assistant_names_status, "active_page": "assistants"},
     )
+
+
+@app.get("/admin/reports/email", response_class=HTMLResponse)
+def admin_email_report_page(request: Request):
+    redirect = require_admin_response(request)
+    if redirect:
+        return redirect
+    return render_admin(
+        request,
+        "admin_email_report.html",
+        {
+            "assistants": list_report_assistant_options(),
+            "default_recipient": env_or_file("REPORT_EMAIL_TO", "") or "",
+            "smtp_from": env_or_file("SMTP_FROM") or env_or_file("SMTP_USERNAME") or "",
+            "active_page": "email-report",
+        },
+    )
+
+
+@app.post("/admin/api/email-report/preview")
+async def admin_api_email_report_preview(request: Request):
+    require_admin_api(request)
+    payload = await read_json_object(request)
+    raw_assistant_ids = payload.get("assistant_ids")
+    assistant_ids = raw_assistant_ids if isinstance(raw_assistant_ids, list) else []
+    hours = int(payload.get("hours") or 24)
+    recipient = str(payload.get("recipient") or env_or_file("REPORT_EMAIL_TO", "") or "").strip()
+    return build_email_report([str(item) for item in assistant_ids], hours=hours, recipient=recipient)
+
+
+@app.post("/admin/api/email-report/send")
+async def admin_api_email_report_send(request: Request):
+    require_admin_api(request)
+    payload = await read_json_object(request)
+    raw_assistant_ids = payload.get("assistant_ids")
+    assistant_ids = raw_assistant_ids if isinstance(raw_assistant_ids, list) else []
+    hours = int(payload.get("hours") or 24)
+    recipient = str(payload.get("recipient") or env_or_file("REPORT_EMAIL_TO", "") or "").strip()
+    if not recipient or "@" not in recipient:
+        raise HTTPException(status_code=400, detail="A valid recipient email is required")
+    report = build_email_report([str(item) for item in assistant_ids], hours=hours, recipient=recipient)
+    return send_email_report(report, recipient)
 
 
 @app.get("/admin/api/assistant-names")

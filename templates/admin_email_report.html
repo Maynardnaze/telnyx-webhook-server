@@ -1,0 +1,62 @@
+{% extends "admin_base.html" %}
+{% block title %}Email Reports · Miswitch Insights Console{% endblock %}
+{% block page_title %}Email Reports{% endblock %}
+{% block page_subtitle %}Multi-assistant AI insight digest{% endblock %}
+{% block content %}
+<p class="page-copy">Select one or more assistants, preview the report, then send it using the configured SMTP sender.</p>
+
+<section class="panel" data-email-report-builder>
+  <div class="panel-head">
+    <h2 class="panel-title">Report settings</h2>
+    <span class="panel-meta">SMTP sender: {{ smtp_from or 'not configured' }}</span>
+  </div>
+  <div class="grid-two">
+    <label>Recipient
+      <input name="recipient" type="email" value="{{ default_recipient }}" placeholder="recipient@example.com">
+    </label>
+    <label>Window
+      <select name="hours">
+        <option value="24" selected>Last 24 hours</option>
+        <option value="48">Last 48 hours</option>
+        <option value="168">Last 7 days</option>
+        <option value="720">Last 30 days</option>
+      </select>
+    </label>
+  </div>
+
+  <h3>Assistants</h3>
+  {% if assistants %}
+  <div class="assistant-grid compact-grid">
+    {% for item in assistants %}
+    <label class="assistant-card checkbox-card">
+      <input type="checkbox" name="assistant_ids" value="{{ item.assistant_id }}" {% if item.count %}checked{% endif %}>
+      <h3>{{ item.assistant_name }}</h3>
+      <div class="id-line">{{ item.assistant_id }}</div>
+      <div class="assistant-stats">
+        <div><span>deliveries</span><strong>{{ item.count }}</strong></div>
+        <div><span>phone</span><strong>{{ item.phone_count }}</strong></div>
+        <div><span>sms</span><strong>{{ item.sms_count }}</strong></div>
+        <div><span>resolved</span><strong>{{ item.resolved_count }}</strong></div>
+      </div>
+    </label>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No assistants found yet. Load Telnyx names or receive insight webhooks first.</div>
+  {% endif %}
+
+  <div class="actions-row">
+    <button type="button" data-email-report-preview>Preview report</button>
+    <button type="button" class="secondary" data-email-report-send>Send email</button>
+    <span data-email-report-status class="panel-meta"></span>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2 class="panel-title">Preview</h2>
+    <button type="button" class="secondary" data-copy-target="email-report-preview">Copy markdown</button>
+  </div>
+  <pre id="email-report-preview"><code data-email-report-preview-output>Select assistants and click Preview report.</code></pre>
+</section>
+{% endblock %}
