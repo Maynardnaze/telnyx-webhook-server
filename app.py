@@ -22,6 +22,7 @@ from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode
 
+import asyncpg
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +37,9 @@ except ImportError:  # pragma: no cover - only happens if optional dependency is
 
 APP_DIR = Path(__file__).parent
 DB_PATH = Path(os.environ.get("WEBHOOK_DB_PATH", "/data/webhook.db"))
+# Optional: Postgres/Supabase connection string. When unset, the shared-dashboard
+# mirror write is fully inert (no pool created, no writes attempted).
+DATABASE_URL = os.environ.get("DATABASE_URL") or None
 # Legacy JSON path used only for one-time migration into SQLite.
 _LEGACY_INSIGHTS_PATH = Path(os.environ.get("WEBHOOK_INSIGHTS_PATH", "/data/insights.json"))
 
@@ -1757,6 +1761,171 @@ def extract_insight_fields(record: dict[str, Any], name_map: dict[str, str] | No
     }
 
 
+# --- Shared-dashboard mirror write (Supabase/Postgres) -----------------------
+# Best-effort: this must never affect the Telnyx webhook response. Local SQLite
+# remains the source of truth for the admin UI, review triage, and retention.
+
+_supabase_pool: "asyncpg.Pool | None" = None
+_supabase_pool_lock = asyncio.Lock()
+
+
+async def get_supabase_pool() -> "asyncpg.Pool | None":
+    global _supabase_pool
+    if not DATABASE_URL:
+        return None
+    if _supabase_pool is None:
+        async with _supabase_pool_lock:
+            if _supabase_pool is None:
+                try:
+                    _supabase_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require")
+                except Exception as exc:  # noqa: BLE001 - best-effort mirror write, must never raise
+                    print(f"[supabase] Failed to create connection pool: {exc}")
+                    return None
+    return _supabase_pool
+
+
+def build_call_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Map a stored MySwitch insight record onto the shared `calls` table shape
+    used by telnyx-voice-ai-sentiment-dashboard. Returns None for non-MySwitch
+    events or records missing an identifiable call/conversation id."""
+    payload, inner, metadata = unwrap_insight_event(record)
+    if inner.get("insight_group_id") != MYSWITCH_INSIGHT_GROUP_ID:
+        return None
+
+    parsed_results = parse_myswitch_results(inner)
+    by_key = {item["key"]: item for item in parsed_results}
+
+    sentiment_value = by_key.get("sentiment_v2", {}).get("value")
+    sentiment_label = sentiment_score = sentiment_confidence = None
+    sentiment_explanation = None
+    sentiment_key_factors = None
+    if isinstance(sentiment_value, dict):
+        sentiment_obj = sentiment_value.get("sentiment") or {}
+        sentiment_label = sentiment_obj.get("label")
+        sentiment_score = sentiment_obj.get("score")
+        sentiment_confidence = sentiment_obj.get("confidence")
+        sentiment_explanation = sentiment_value.get("explanation")
+        sentiment_key_factors = sentiment_value.get("key_factors")
+
+    category_value = by_key.get("call_category", {}).get("value")
+    primary_category = issue_description = None
+    if isinstance(category_value, dict):
+        primary_category = category_value.get("primary_category")
+        issue_description = category_value.get("issue_description")
+
+    resolution_value = by_key.get("resolution_status", {}).get("value")
+    resolution_status = resolved_by_agent = transfer_reason = None
+    if isinstance(resolution_value, dict):
+        resolution_status = resolution_value.get("resolution_status")
+        resolved_by_agent = resolution_value.get("resolved_by_agent")
+        transfer_reason = resolution_value.get("transfer_reason")
+
+    summary_value = by_key.get("summary", {}).get("value")
+    summary_text = summary_value if isinstance(summary_value, str) else None
+
+    conversation_id = first_present(inner.get("conversation_id"), payload.get("conversation_id"))
+    call_control_id = metadata.get("call_control_id")
+    call_id = conversation_id or record.get("id")
+    if not call_id:
+        return None
+
+    # asyncpg requires a real datetime for a timestamptz-cast parameter, not an ISO string.
+    try:
+        received_at = datetime.fromisoformat(str(record.get("received_at") or utc_now()).replace("Z", "+00:00"))
+        if received_at.tzinfo is None:
+            received_at = received_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        received_at = datetime.now(timezone.utc)
+
+    return {
+        "id": call_id,
+        "conversation_id": conversation_id,
+        "call_control_id": call_control_id,
+        "timestamp": received_at,
+        "duration": 0,
+        "sentiment": sentiment_label,
+        "sentiment_confidence": sentiment_confidence,
+        "sentiment_explanation": sentiment_explanation,
+        "sentiment_key_factors": json.dumps(sentiment_key_factors) if sentiment_key_factors is not None else None,
+        "sentiment_score": sentiment_score or 0,
+        "primary_category": primary_category,
+        "subcategory": None,
+        "issue_description": issue_description,
+        "secondary_topics": None,
+        "resolution_status": resolution_status,
+        "resolved_by_agent": bool(resolved_by_agent) if resolved_by_agent is not None else None,
+        "transfer_reason": transfer_reason,
+        "summary": summary_text,
+        "raw_insight_data": json.dumps(record, separators=(",", ":")),
+    }
+
+
+async def upsert_call_to_supabase(call_row: dict[str, Any] | None) -> None:
+    if not call_row:
+        return
+    try:
+        pool = await get_supabase_pool()
+        if pool is None:
+            return
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO calls (
+                    id, conversation_id, call_control_id, timestamp, duration,
+                    sentiment, sentiment_confidence, sentiment_explanation, sentiment_key_factors, sentiment_score,
+                    primary_category, subcategory, issue_description, secondary_topics,
+                    resolution_status, resolved_by_agent, transfer_reason,
+                    summary, raw_insight_data, updated_at
+                ) VALUES (
+                    $1, $2, $3, $4::timestamptz, $5,
+                    $6, $7, $8, $9::jsonb, $10,
+                    $11, $12, $13, $14::jsonb,
+                    $15, $16, $17,
+                    $18, $19::jsonb, NOW()
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    conversation_id = EXCLUDED.conversation_id,
+                    call_control_id = EXCLUDED.call_control_id,
+                    timestamp = EXCLUDED.timestamp,
+                    duration = EXCLUDED.duration,
+                    sentiment = EXCLUDED.sentiment,
+                    sentiment_confidence = EXCLUDED.sentiment_confidence,
+                    sentiment_explanation = EXCLUDED.sentiment_explanation,
+                    sentiment_key_factors = EXCLUDED.sentiment_key_factors,
+                    sentiment_score = EXCLUDED.sentiment_score,
+                    primary_category = EXCLUDED.primary_category,
+                    subcategory = EXCLUDED.subcategory,
+                    issue_description = EXCLUDED.issue_description,
+                    secondary_topics = EXCLUDED.secondary_topics,
+                    resolution_status = EXCLUDED.resolution_status,
+                    resolved_by_agent = EXCLUDED.resolved_by_agent,
+                    transfer_reason = EXCLUDED.transfer_reason,
+                    summary = EXCLUDED.summary,
+                    raw_insight_data = EXCLUDED.raw_insight_data,
+                    updated_at = NOW()
+                """,
+                call_row["id"], call_row["conversation_id"], call_row["call_control_id"],
+                call_row["timestamp"], call_row["duration"],
+                call_row["sentiment"], call_row["sentiment_confidence"], call_row["sentiment_explanation"],
+                call_row["sentiment_key_factors"], call_row["sentiment_score"],
+                call_row["primary_category"], call_row["subcategory"], call_row["issue_description"],
+                call_row["secondary_topics"],
+                call_row["resolution_status"], call_row["resolved_by_agent"], call_row["transfer_reason"],
+                call_row["summary"], call_row["raw_insight_data"],
+            )
+    except Exception as exc:  # noqa: BLE001 - best-effort mirror write, must never raise
+        print(f"[supabase] Failed to upsert call record: {exc}")
+
+
+async def sync_call_to_supabase(record: dict[str, Any]) -> None:
+    try:
+        call_row = build_call_record(record)
+    except Exception as exc:  # noqa: BLE001 - best-effort mirror write, must never raise
+        print(f"[supabase] Failed to build call record: {exc}")
+        return
+    await upsert_call_to_supabase(call_row)
+
+
 def build_insight_detail_context(record: dict[str, Any]) -> dict[str, Any]:
     payload, inner, metadata = unwrap_insight_event(record)
     parsed_results = parse_myswitch_results(inner)
@@ -2513,6 +2682,7 @@ async def assistant_initialization(
 @app.post("/telnyx/insights")
 async def receive_telnyx_insights(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_webhook_secret: str | None = Header(default=None),
     telnyx_signature_ed25519: str | None = Header(default=None),
     telnyx_timestamp: str | None = Header(default=None),
@@ -2539,6 +2709,7 @@ async def receive_telnyx_insights(
         },
         path=str(request.url.path),
     )
+    background_tasks.add_task(sync_call_to_supabase, record)
     return {"accepted": True, "id": record["id"]}
 
 

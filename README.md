@@ -143,6 +143,7 @@ Runtime configuration is managed in Doppler. Do not keep long-lived `.env` files
 | `WEBHOOK_SECRET` | Yes | Shared secret for admin login and protected endpoints |
 | `TELNYX_PUBLIC_KEY` | Production: yes | Telnyx Ed25519 public key for `/telnyx/insights` signature verification |
 | `TELNYX_API_KEY` | Feature-dependent | Telnyx REST API key for assistant names, Add Messages, and SMS helpers |
+| `DATABASE_URL` | No | Supabase/Postgres connection string. When set, every accepted MySwitch insight is also mirrored (best-effort, background task) into a shared `calls` table for the telnyx-voice-ai-sentiment-dashboard app. Local SQLite storage is unaffected either way. |
 | `SAGEBRUSH_SMS_FROM_NUMBER` | No | Fixed SMS-capable sender for Sagebrush menu SMS wrapper; defaults to the Sagebrush DID |
 | `TRIPLESEAT_PUBLIC_KEY` | Feature-dependent | Tripleseat public lead-form API key for creating leads from assistant tools |
 | `TRIPLESEAT_ACCESS_TOKEN` | Feature-dependent | Tripleseat OAuth bearer token for booking/event API calls when enabled |
