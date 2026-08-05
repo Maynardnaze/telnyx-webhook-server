@@ -12,7 +12,7 @@ https://webhook.miswitch.cloud
 
 - **Receives Telnyx webhooks** at `POST /telnyx/insights`
 - **Verifies Telnyx Ed25519 signatures** when `TELNYX_PUBLIC_KEY` is configured
-- **Stores payloads in SQLite** for later inspection
+- **Stores payloads in Supabase Postgres** (SQLite fallback for local dev) for later inspection
 - **Exposes a read-only listing** at `GET /telnyx/insights` (shared-secret protected)
 - **Provides a private web admin UI** at `/admin` for browsing insights and testing webhook helpers
 - **Accepts dry-run async tool requests** at `/telnyx/tools/async/{tool_name}` and records Add Messages payloads without external writes
@@ -39,7 +39,7 @@ telnyx-webhook-server/
 ├── docker-compose.yml     # Production Compose stack; expects Doppler-injected env vars
 ├── Dockerfile
 └── data/                  # Runtime data (gitignored except .gitkeep)
-    └── webhook.db         # SQLite database (created on first run)
+    └── webhook.db         # SQLite fallback database (local dev only; production uses DATABASE_URL)
 ```
 
 ## Quick start (Docker + Doppler)
@@ -143,7 +143,7 @@ Runtime configuration is managed in Doppler. Do not keep long-lived `.env` files
 | `WEBHOOK_SECRET` | Yes | Shared secret for admin login and protected endpoints |
 | `TELNYX_PUBLIC_KEY` | Production: yes | Telnyx Ed25519 public key for `/telnyx/insights` signature verification |
 | `TELNYX_API_KEY` | Feature-dependent | Telnyx REST API key for assistant names, Add Messages, and SMS helpers |
-| `DATABASE_URL` | No | Supabase/Postgres connection string. When set, every accepted MySwitch insight is also mirrored (best-effort, background task) into a shared `calls` table for the telnyx-voice-ai-sentiment-dashboard app. Local SQLite storage is unaffected either way. |
+| `DATABASE_URL` | Production: yes | Supabase/Postgres connection string. When set, Postgres is the primary store for all tables (server is stateless) and accepted MySwitch insights are mirrored into the shared `calls` table for telnyx-voice-ai-sentiment-dashboard. When unset, storage falls back to local SQLite and the mirror is inert. |
 | `SAGEBRUSH_SMS_FROM_NUMBER` | No | Fixed SMS-capable sender for Sagebrush menu SMS wrapper; defaults to the Sagebrush DID |
 | `TRIPLESEAT_PUBLIC_KEY` | Feature-dependent | Tripleseat public lead-form API key for creating leads from assistant tools |
 | `TRIPLESEAT_ACCESS_TOKEN` | Feature-dependent | Tripleseat OAuth bearer token for booking/event API calls when enabled |
@@ -192,26 +192,28 @@ When configured, Telnyx can POST to the clean URL without `?secret=`:
 https://webhook.miswitch.cloud/telnyx/insights
 ```
 
-## Data storage (SQLite)
+## Data storage (Supabase Postgres, SQLite fallback)
 
-Insight payloads are stored in a single SQLite file:
-
-```text
-./data/webhook.db
-```
+When `DATABASE_URL` is set (production), all state lives in Supabase/Postgres
+and the server is stateless — safe to rebuild or move hosts with no volume to
+carry over. When unset (local dev, tests), the same tables are kept in a
+SQLite file at `./data/webhook.db` instead.
 
 | Table | Contents | Retention |
 |-------|----------|-----------|
 | `insights` | Received Telnyx Insight Group payloads | Last **500** records (oldest pruned on insert) |
 | `insight_reviews` | Admin triage state per insight (status, labels, note) | Deleted automatically when the matching insight is pruned |
-
-The `./data` directory is bind-mounted into the container at `/data`. Back up by copying `data/webhook.db`.
-
-Async tool jobs are stored in the same SQLite database:
-
-| Table | Contents | Purpose |
-|-------|----------|---------|
 | `async_tool_jobs` | Async tool request/response lifecycle | Dry-run queue records and prepared Telnyx Add Messages payloads |
+| `sms_idempotency_keys` | Sent-SMS dedupe keys | Unbounded |
+| `calls` | Flattened MySwitch insight mirror read by telnyx-voice-ai-sentiment-dashboard | Unbounded (survives insight pruning) |
+
+### Migrating an existing SQLite database to Supabase
+
+One-off, safe to re-run (`ON CONFLICT DO NOTHING` / upsert):
+
+```bash
+DATABASE_URL=postgresql://... python3 scripts/migrate_sqlite_to_supabase.py [path/to/webhook.db]
+```
 
 ### Migrating from legacy JSON
 

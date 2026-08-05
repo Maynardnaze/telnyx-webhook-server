@@ -22,7 +22,9 @@ from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode
 
-import asyncpg
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,9 +39,13 @@ except ImportError:  # pragma: no cover - only happens if optional dependency is
 
 APP_DIR = Path(__file__).parent
 DB_PATH = Path(os.environ.get("WEBHOOK_DB_PATH", "/data/webhook.db"))
-# Optional: Postgres/Supabase connection string. When unset, the shared-dashboard
-# mirror write is fully inert (no pool created, no writes attempted).
+# Postgres/Supabase connection string. When set, Postgres is the primary store
+# for insights, reviews, async jobs, and SMS idempotency keys (the server is
+# then stateless) and the shared-dashboard `calls` mirror is active. When unset
+# (local dev, tests), storage falls back to SQLite at DB_PATH and the mirror is
+# fully inert.
 DATABASE_URL = os.environ.get("DATABASE_URL") or None
+USE_POSTGRES = bool(DATABASE_URL)
 # Legacy JSON path used only for one-time migration into SQLite.
 _LEGACY_INSIGHTS_PATH = Path(os.environ.get("WEBHOOK_INSIGHTS_PATH", "/data/insights.json"))
 
@@ -626,9 +632,10 @@ def save_sms_idempotency_record(
         try:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO sms_idempotency_keys
+                INSERT INTO sms_idempotency_keys
                 (idempotency_key, template_name, to_number, from_number, message_id, request_data, response_data, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (idempotency_key) DO NOTHING
                 """,
                 (
                     idempotency_key,
@@ -871,7 +878,55 @@ def post_tripleseat_resource(resource: str, body: dict[str, Any], *, dry_run: bo
         raise HTTPException(status_code=502, detail=f"Tripleseat API request failed: {exc.reason}") from exc
 
 
-def _db_connect() -> sqlite3.Connection:
+_pg_pool: ConnectionPool | None = None
+_pg_pool_lock = threading.Lock()
+
+
+def _get_pg_pool() -> ConnectionPool:
+    global _pg_pool
+    if _pg_pool is None:
+        with _pg_pool_lock:
+            if _pg_pool is None:
+                _pg_pool = ConnectionPool(
+                    DATABASE_URL,
+                    min_size=1,
+                    max_size=5,
+                    kwargs={"row_factory": dict_row, "sslmode": "require"},
+                    check=ConnectionPool.check_connection,
+                )
+    return _pg_pool
+
+
+class _PgConn:
+    """Adapts a pooled psycopg connection to the sqlite3-style API used by the
+    storage helpers, so every query below runs unchanged on either backend."""
+
+    def __init__(self) -> None:
+        self._pool = _get_pg_pool()
+        self._conn = self._pool.getconn()
+
+    def execute(self, sql: str, params: tuple = ()) -> "psycopg.Cursor":
+        return self._conn.execute(sql.replace("?", "%s"), params)
+
+    def executescript(self, sql: str) -> None:
+        self._conn.execute(sql)
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def close(self) -> None:
+        # Roll back any uncommitted read transaction before returning the
+        # connection, otherwise the pool holds it "idle in transaction".
+        try:
+            self._conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        self._pool.putconn(self._conn)
+
+
+def _db_connect() -> "sqlite3.Connection | _PgConn":
+    if USE_POSTGRES:
+        return _PgConn()
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -927,14 +982,50 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_sms_idempotency_created_at ON sms_idempotency_keys(created_at);
                 """
             )
+            if USE_POSTGRES:
+                # Shared table read by telnyx-voice-ai-sentiment-dashboard;
+                # kept in sync with its backend/schema.sql.
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS calls (
+                        id TEXT PRIMARY KEY,
+                        conversation_id TEXT UNIQUE,
+                        call_control_id TEXT,
+                        timestamp TIMESTAMPTZ NOT NULL,
+                        duration INTEGER DEFAULT 0,
+                        sentiment TEXT CHECK (sentiment IN ('Positive', 'Neutral', 'Negative', 'Mixed')),
+                        sentiment_confidence REAL,
+                        sentiment_explanation TEXT,
+                        sentiment_key_factors JSONB,
+                        sentiment_score REAL DEFAULT 0,
+                        primary_category TEXT,
+                        subcategory TEXT,
+                        issue_description TEXT,
+                        secondary_topics JSONB,
+                        resolution_status TEXT CHECK (resolution_status IN ('Resolved', 'Transferred', 'Partially Resolved', 'Unresolved')),
+                        resolved_by_agent BOOLEAN,
+                        transfer_reason TEXT,
+                        summary TEXT,
+                        raw_insight_data JSONB,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_calls_sentiment ON calls(sentiment);
+                    CREATE INDEX IF NOT EXISTS idx_calls_call_control_id ON calls(call_control_id);
+                    CREATE INDEX IF NOT EXISTS idx_calls_updated_at ON calls(updated_at);
+                    CREATE INDEX IF NOT EXISTS idx_calls_primary_category ON calls(primary_category);
+                    CREATE INDEX IF NOT EXISTS idx_calls_resolution_status ON calls(resolution_status);
+                    """
+                )
             conn.commit()
             _migrate_legacy_insights(conn)
         finally:
             conn.close()
 
 
-def _migrate_legacy_insights(conn: sqlite3.Connection) -> None:
-    insight_count = conn.execute("SELECT COUNT(*) FROM insights").fetchone()[0]
+def _migrate_legacy_insights(conn: "sqlite3.Connection | _PgConn") -> None:
+    insight_count = conn.execute("SELECT COUNT(*) AS n FROM insights").fetchone()["n"]
     if insight_count == 0 and _LEGACY_INSIGHTS_PATH.exists():
         try:
             insights = json.loads(_LEGACY_INSIGHTS_PATH.read_text(encoding="utf-8"))
@@ -944,7 +1035,7 @@ def _migrate_legacy_insights(conn: sqlite3.Connection) -> None:
             for record in insights[-500:]:
                 if isinstance(record, dict) and record.get("id"):
                     conn.execute(
-                        "INSERT OR IGNORE INTO insights (id, received_at, data) VALUES (?, ?, ?)",
+                        "INSERT INTO insights (id, received_at, data) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING",
                         (
                             record["id"],
                             record.get("received_at") or utc_now(),
@@ -1278,7 +1369,7 @@ def append_insight(record: dict[str, Any]) -> None:
                     json.dumps(record, separators=(",", ":")),
                 ),
             )
-            excess = conn.execute("SELECT COUNT(*) - 500 FROM insights").fetchone()[0]
+            excess = conn.execute("SELECT COUNT(*) - 500 AS excess FROM insights").fetchone()["excess"]
             if excess > 0:
                 conn.execute(
                     """
@@ -1305,7 +1396,7 @@ def default_review(insight_id: str) -> dict[str, Any]:
     return {"insight_id": insight_id, "status": "new", "labels": [], "note": "", "updated_at": None}
 
 
-def _decode_review_row(row: sqlite3.Row) -> dict[str, Any]:
+def _decode_review_row(row: "sqlite3.Row | dict[str, Any]") -> dict[str, Any]:
     try:
         labels = json.loads(row["labels"] or "[]")
     except json.JSONDecodeError:
@@ -1453,7 +1544,7 @@ def create_async_tool_job(tool_name: str, call_control_id: str, request_body: di
     return job
 
 
-def _decode_job_row(row: sqlite3.Row) -> dict[str, Any]:
+def _decode_job_row(row: "sqlite3.Row | dict[str, Any]") -> dict[str, Any]:
     def maybe_json(value: str | None) -> Any:
         if value is None:
             return None
@@ -1762,26 +1853,9 @@ def extract_insight_fields(record: dict[str, Any], name_map: dict[str, str] | No
 
 
 # --- Shared-dashboard mirror write (Supabase/Postgres) -----------------------
-# Best-effort: this must never affect the Telnyx webhook response. Local SQLite
-# remains the source of truth for the admin UI, review triage, and retention.
-
-_supabase_pool: "asyncpg.Pool | None" = None
-_supabase_pool_lock = asyncio.Lock()
-
-
-async def get_supabase_pool() -> "asyncpg.Pool | None":
-    global _supabase_pool
-    if not DATABASE_URL:
-        return None
-    if _supabase_pool is None:
-        async with _supabase_pool_lock:
-            if _supabase_pool is None:
-                try:
-                    _supabase_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require")
-                except Exception as exc:  # noqa: BLE001 - best-effort mirror write, must never raise
-                    print(f"[supabase] Failed to create connection pool: {exc}")
-                    return None
-    return _supabase_pool
+# Best-effort: this must never affect the Telnyx webhook response. Uses the
+# same Postgres pool as primary storage; fully inert when DATABASE_URL is
+# unset. Runs as a sync FastAPI background task (threadpool).
 
 
 def build_call_record(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -1829,7 +1903,7 @@ def build_call_record(record: dict[str, Any]) -> dict[str, Any] | None:
     if not call_id:
         return None
 
-    # asyncpg requires a real datetime for a timestamptz-cast parameter, not an ISO string.
+    # The timestamptz-cast parameter needs a real datetime, not an ISO string.
     try:
         received_at = datetime.fromisoformat(str(record.get("received_at") or utc_now()).replace("Z", "+00:00"))
         if received_at.tzinfo is None:
@@ -1860,15 +1934,12 @@ def build_call_record(record: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-async def upsert_call_to_supabase(call_row: dict[str, Any] | None) -> None:
-    if not call_row:
+def upsert_call_to_supabase(call_row: dict[str, Any] | None) -> None:
+    if not call_row or not USE_POSTGRES:
         return
     try:
-        pool = await get_supabase_pool()
-        if pool is None:
-            return
-        async with pool.acquire() as conn:
-            await conn.execute(
+        with _get_pg_pool().connection() as conn:
+            conn.execute(
                 """
                 INSERT INTO calls (
                     id, conversation_id, call_control_id, timestamp, duration,
@@ -1877,11 +1948,11 @@ async def upsert_call_to_supabase(call_row: dict[str, Any] | None) -> None:
                     resolution_status, resolved_by_agent, transfer_reason,
                     summary, raw_insight_data, updated_at
                 ) VALUES (
-                    $1, $2, $3, $4::timestamptz, $5,
-                    $6, $7, $8, $9::jsonb, $10,
-                    $11, $12, $13, $14::jsonb,
-                    $15, $16, $17,
-                    $18, $19::jsonb, NOW()
+                    %s, %s, %s, %s::timestamptz, %s,
+                    %s, %s, %s, %s::jsonb, %s,
+                    %s, %s, %s, %s::jsonb,
+                    %s, %s, %s,
+                    %s, %s::jsonb, NOW()
                 )
                 ON CONFLICT (id) DO UPDATE SET
                     conversation_id = EXCLUDED.conversation_id,
@@ -1904,26 +1975,28 @@ async def upsert_call_to_supabase(call_row: dict[str, Any] | None) -> None:
                     raw_insight_data = EXCLUDED.raw_insight_data,
                     updated_at = NOW()
                 """,
-                call_row["id"], call_row["conversation_id"], call_row["call_control_id"],
-                call_row["timestamp"], call_row["duration"],
-                call_row["sentiment"], call_row["sentiment_confidence"], call_row["sentiment_explanation"],
-                call_row["sentiment_key_factors"], call_row["sentiment_score"],
-                call_row["primary_category"], call_row["subcategory"], call_row["issue_description"],
-                call_row["secondary_topics"],
-                call_row["resolution_status"], call_row["resolved_by_agent"], call_row["transfer_reason"],
-                call_row["summary"], call_row["raw_insight_data"],
+                (
+                    call_row["id"], call_row["conversation_id"], call_row["call_control_id"],
+                    call_row["timestamp"], call_row["duration"],
+                    call_row["sentiment"], call_row["sentiment_confidence"], call_row["sentiment_explanation"],
+                    call_row["sentiment_key_factors"], call_row["sentiment_score"],
+                    call_row["primary_category"], call_row["subcategory"], call_row["issue_description"],
+                    call_row["secondary_topics"],
+                    call_row["resolution_status"], call_row["resolved_by_agent"], call_row["transfer_reason"],
+                    call_row["summary"], call_row["raw_insight_data"],
+                ),
             )
     except Exception as exc:  # noqa: BLE001 - best-effort mirror write, must never raise
         print(f"[supabase] Failed to upsert call record: {exc}")
 
 
-async def sync_call_to_supabase(record: dict[str, Any]) -> None:
+def sync_call_to_supabase(record: dict[str, Any]) -> None:
     try:
         call_row = build_call_record(record)
     except Exception as exc:  # noqa: BLE001 - best-effort mirror write, must never raise
         print(f"[supabase] Failed to build call record: {exc}")
         return
-    await upsert_call_to_supabase(call_row)
+    upsert_call_to_supabase(call_row)
 
 
 def build_insight_detail_context(record: dict[str, Any]) -> dict[str, Any]:
@@ -1948,10 +2021,10 @@ def get_console_summary() -> dict[str, Any]:
     with _db_lock:
         conn = _db_connect()
         try:
-            row = conn.execute("SELECT COUNT(*), MAX(received_at) FROM insights").fetchone()
+            row = conn.execute("SELECT COUNT(*) AS n, MAX(received_at) AS latest FROM insights").fetchone()
         finally:
             conn.close()
-    count, latest = row[0], row[1]
+    count, latest = row["n"], row["latest"]
     return {
         "insight_count": count,
         "latest_received_at": latest,
@@ -2031,7 +2104,8 @@ def get_insight_stats() -> dict[str, Any]:
     return {
         "ok": True,
         "service": "miswitch-telnyx-webhook",
-        "db_path": str(DB_PATH),
+        "db_backend": "postgres" if USE_POSTGRES else "sqlite",
+        "db_path": None if USE_POSTGRES else str(DB_PATH),
         "insight_count": len(insights),
         "phone_count": phone_count,
         "sms_count": sms_count,
