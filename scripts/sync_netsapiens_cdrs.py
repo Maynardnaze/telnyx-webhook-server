@@ -182,9 +182,12 @@ def ensure_cdr_subscription(token: str, domain: str) -> None:
         subs = _extract_subscriptions(json.loads(body) if body.strip() else [])
     except ValueError:
         subs = []
+    endpoint_base = post_url.split("?", 1)[0]
     ours = [
         s for s in subs
-        if str(s.get("model")) == "cdr" and str(s.get("post_url")) == post_url and str(s.get("domain")) == domain
+        if str(s.get("model")) == "cdr"
+        and str(s.get("domain")) == domain
+        and str(s.get("post_url", "")).split("?", 1)[0] == endpoint_base
     ]
     now = datetime.now(tz=timezone.utc)
     renew_cutoff = now + timedelta(days=SUBSCRIPTION_RENEW_BEFORE_DAYS)
@@ -194,7 +197,7 @@ def ensure_cdr_subscription(token: str, domain: str) -> None:
             expires = datetime.strptime(str(sub.get("expires")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         except ValueError:
             expires = None
-        if expires and expires > renew_cutoff and keep is None:
+        if expires and expires > renew_cutoff and keep is None and str(sub.get("post_url")) == post_url:
             keep = sub
         else:
             sub_id = sub.get("subscription_id")
