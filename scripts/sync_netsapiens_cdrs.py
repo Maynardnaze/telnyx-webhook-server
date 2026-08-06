@@ -52,10 +52,12 @@ CREATE TABLE IF NOT EXISTS cdrs (
   release_code TEXT,
   release_text TEXT,
   codec TEXT,
+  mos REAL,
   raw JSONB NOT NULL,
   first_synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE cdrs ADD COLUMN IF NOT EXISTS mos REAL;
 CREATE INDEX IF NOT EXISTS idx_cdrs_time_start ON cdrs (time_start);
 CREATE INDEX IF NOT EXISTS idx_cdrs_from_time ON cdrs (orig_from_user, time_start);
 CREATE INDEX IF NOT EXISTS idx_cdrs_domain_time ON cdrs (domain, time_start);
@@ -66,13 +68,13 @@ INSERT INTO cdrs (
   cdr_id, domain, territory, type_code, orig_sub, term_sub, by_sub,
   orig_from_user, orig_from_name, orig_to_user, orig_req_user,
   time_start, time_answer, time_release, duration, time_talking,
-  release_code, release_text, codec, raw
+  release_code, release_text, codec, mos, raw
 ) VALUES (
   %(cdr_id)s, %(domain)s, %(territory)s, %(type_code)s, %(orig_sub)s,
   %(term_sub)s, %(by_sub)s, %(orig_from_user)s, %(orig_from_name)s,
   %(orig_to_user)s, %(orig_req_user)s, %(time_start)s, %(time_answer)s,
   %(time_release)s, %(duration)s, %(time_talking)s, %(release_code)s,
-  %(release_text)s, %(codec)s, %(raw)s
+  %(release_text)s, %(codec)s, %(mos)s, %(raw)s
 )
 ON CONFLICT (cdr_id) DO UPDATE SET
   duration = EXCLUDED.duration,
@@ -81,6 +83,7 @@ ON CONFLICT (cdr_id) DO UPDATE SET
   time_talking = EXCLUDED.time_talking,
   release_code = EXCLUDED.release_code,
   release_text = EXCLUDED.release_text,
+  mos = EXCLUDED.mos,
   raw = EXCLUDED.raw,
   updated_at = NOW()
 """
@@ -135,6 +138,7 @@ def fetch_cdr_page(token: str, domain: str, start: datetime, end: datetime, offs
             "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
             "format": "json",
             "raw": "yes",
+            "qos": "yes",
             "start": str(offset),
             "limit": str(PAGE_SIZE),
         },
@@ -253,6 +257,21 @@ def from_user(record: dict, leg: dict) -> str | None:
     return None
 
 
+def extract_mos(record: dict) -> float | None:
+    """Worst MOS across both legs' A/B streams (portal shows the same score /10)."""
+    values = []
+    for leg_key in ("qos_orig", "qos_term"):
+        leg = record.get(leg_key)
+        if not isinstance(leg, dict):
+            continue
+        for side in ("a_mos_min_mult10", "b_mos_min_mult10"):
+            try:
+                values.append(int(str(leg.get(side))))
+            except (TypeError, ValueError):
+                continue
+    return min(values) / 10 if values else None
+
+
 def to_row(record: dict) -> dict | None:
     cdr_id = str(record.get("cdr_id") or "").strip()
     if not cdr_id:
@@ -278,6 +297,7 @@ def to_row(record: dict) -> dict | None:
         "release_code": leg.get("release_code"),
         "release_text": leg.get("release_text"),
         "codec": leg.get("codec"),
+        "mos": extract_mos(record),
         "raw": json.dumps(record),
     }
 
