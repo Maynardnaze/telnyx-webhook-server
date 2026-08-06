@@ -11,6 +11,8 @@ import re
 import smtplib
 import sqlite3
 import ssl
+import subprocess
+import sys
 import time
 import threading
 import uuid
@@ -2795,3 +2797,59 @@ def list_telnyx_insights(
     check_secret(x_webhook_secret, request.query_params.get("secret"))
     insights = read_insights()
     return {"count": len(insights), "insights": insights[-50:]}
+
+
+_netsapiens_sync_lock = threading.Lock()
+_netsapiens_sync_last = 0.0
+NETSAPIENS_SYNC_DEBOUNCE_SECONDS = 30.0
+
+
+def run_netsapiens_cdr_sync() -> None:
+    """Pull recent CDRs through the authoritative cdr2 API.
+
+    Debounced: a burst of per-leg events for one call triggers a single pull.
+    Anything skipped here is picked up by the cron sync.
+    """
+    global _netsapiens_sync_last
+    with _netsapiens_sync_lock:
+        now = time.monotonic()
+        if now - _netsapiens_sync_last < NETSAPIENS_SYNC_DEBOUNCE_SECONDS:
+            return
+        _netsapiens_sync_last = now
+    script = APP_DIR / "scripts" / "sync_netsapiens_cdrs.py"
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script), "--days", "0.25"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode != 0:
+            print(f"netsapiens cdr sync failed (rc={result.returncode}): {result.stderr.strip()[:500]}")
+    except Exception as exc:  # noqa: BLE001 - event delivery must never depend on the sync
+        print(f"netsapiens cdr sync failed: {exc}")
+
+
+@app.post("/netsapiens/cdr")
+async def receive_netsapiens_cdr_event(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """CDR event push from the NetSapiens PBX subscription.
+
+    Push payloads lack the cdr_id that keys the cdrs table, so events are not
+    stored directly; each delivery just triggers an immediate pull of the
+    authoritative records. NetSapiens cannot sign requests, so the shared
+    secret rides in the subscription's post_url query string.
+    """
+    if not has_valid_shared_secret(x_webhook_secret, request.query_params.get("secret")):
+        raise HTTPException(status_code=401, detail="Missing or invalid webhook secret")
+    raw_body = await request.body()
+    try:
+        payload = json.loads(raw_body.decode("utf-8") or "[]")
+    except Exception:
+        payload = []
+    events = payload if isinstance(payload, list) else [payload]
+    background_tasks.add_task(run_netsapiens_cdr_sync)
+    return {"accepted": True, "events": len(events)}

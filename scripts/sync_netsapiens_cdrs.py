@@ -147,6 +147,83 @@ def fetch_cdr_page(token: str, domain: str, start: datetime, end: datetime, offs
     return data
 
 
+SUBSCRIPTION_TTL_DAYS = 365
+SUBSCRIPTION_RENEW_BEFORE_DAYS = 30
+
+
+def _extract_subscriptions(data: object) -> list[dict]:
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    if isinstance(data, dict):
+        for value in data.values():
+            if isinstance(value, list):
+                return [d for d in value if isinstance(d, dict)]
+        return [data] if data else []
+    return []
+
+
+def ensure_cdr_subscription(token: str, domain: str) -> None:
+    """Keep a non-expiring CDR push subscription pointed at NETSAPIENS_CDR_POST_URL.
+
+    NetSapiens subscriptions always carry an expiry (and the docs warn the
+    server computes it unreliably), so every sync run recreates the
+    subscription whenever it is missing or expires within
+    SUBSCRIPTION_RENEW_BEFORE_DAYS.
+    """
+    post_url = os.environ.get("NETSAPIENS_CDR_POST_URL", "").strip()
+    if not post_url:
+        return
+    body = post_form(
+        f"{api_base()}/",
+        {"object": "event", "action": "read", "domain": domain, "format": "json"},
+        token=token,
+    )
+    try:
+        subs = _extract_subscriptions(json.loads(body) if body.strip() else [])
+    except ValueError:
+        subs = []
+    ours = [
+        s for s in subs
+        if str(s.get("model")) == "cdr" and str(s.get("post_url")) == post_url and str(s.get("domain")) == domain
+    ]
+    now = datetime.now(tz=timezone.utc)
+    renew_cutoff = now + timedelta(days=SUBSCRIPTION_RENEW_BEFORE_DAYS)
+    keep = None
+    for sub in ours:
+        try:
+            expires = datetime.strptime(str(sub.get("expires")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            expires = None
+        if expires and expires > renew_cutoff and keep is None:
+            keep = sub
+        else:
+            sub_id = sub.get("subscription_id")
+            if sub_id:
+                post_form(
+                    f"{api_base()}/",
+                    {"object": "event", "action": "delete", "subscription_id": str(sub_id)},
+                    token=token,
+                )
+                print(f"Deleted stale/expiring CDR subscription {sub_id}")
+    if keep:
+        return
+    expires_str = (now + timedelta(days=SUBSCRIPTION_TTL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    post_form(
+        f"{api_base()}/",
+        {
+            "object": "event",
+            "action": "create",
+            "model": "cdr",
+            "domain": domain,
+            "user": "*",
+            "post_url": post_url,
+            "expires": expires_str,
+        },
+        token=token,
+    )
+    print(f"Created CDR subscription for {domain} expiring {expires_str}")
+
+
 def epoch_to_dt(value: object) -> datetime | None:
     try:
         epoch = int(str(value))
@@ -204,6 +281,11 @@ def to_row(record: dict) -> dict | None:
 
 def sync(domain: str, start: datetime, end: datetime, dry_run: bool) -> None:
     token = get_access_token()
+    if not dry_run:
+        try:
+            ensure_cdr_subscription(token, domain)
+        except Exception as exc:  # noqa: BLE001 - subscription upkeep must not block the sync
+            print(f"Warning: could not ensure CDR subscription: {exc}")
     rows: list[dict] = []
     offset = 0
     while True:

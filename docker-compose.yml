@@ -37,6 +37,7 @@ services:
       NETSAPIENS_USERNAME: ${NETSAPIENS_USERNAME:-}
       NETSAPIENS_PASSWORD: ${NETSAPIENS_PASSWORD:-}
       NETSAPIENS_CDR_DOMAIN: ${NETSAPIENS_CDR_DOMAIN:-miswitch.22191.service}
+      NETSAPIENS_CDR_POST_URL: ${NETSAPIENS_CDR_POST_URL:-}
     volumes:
       - ./data:/data
     labels:
